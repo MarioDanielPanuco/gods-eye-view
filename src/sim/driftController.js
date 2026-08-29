@@ -156,12 +156,18 @@ export function createDriftController({
 
   function dispose() {
     if (!_active) return;
-    if (_active.playTimer) clearInterval(_active.playTimer);
-    _active.panel?.destroy?.();
-    overlayHost.clearSource(DRIFT_OVERLAY_SOURCE_ID);
-    viewer?.scene?.primitives?.remove?.(_active.collection);
-    _active.collection?.destroy?.();
+    const { collection, panel, playTimer } = _active;
+    // Null out FIRST so a teardown throw can never brick the next start().
     _active = null;
+    if (playTimer) clearInterval(playTimer);
+    panel?.destroy?.();
+    overlayHost.clearSource(DRIFT_OVERLAY_SOURCE_ID);
+    // PrimitiveCollection.remove DESTROYS the primitive (destroyPrimitives
+    // defaults to true) — calling destroy() again after remove() throws and
+    // was the "simulation only runs once" bug. Destroy ourselves only when
+    // the scene never took ownership (no viewer) and it is still alive.
+    viewer?.scene?.primitives?.remove?.(collection);
+    if (collection && !collection.isDestroyed?.()) collection.destroy?.();
     governorRequestRender('drift-dispose');
   }
 

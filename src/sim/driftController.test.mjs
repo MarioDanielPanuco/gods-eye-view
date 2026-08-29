@@ -67,9 +67,17 @@ function makeCollection() {
   const points = [];
   return {
     points,
+    destroyCalls: 0,
     add(options) { const p = { ...options }; points.push(p); return p; },
     removeAll() { points.length = 0; },
-    destroy() { this.destroyed = true; },
+    isDestroyed() { return Boolean(this.destroyed); },
+    // Honor Cesium's contract: destroying a destroyed object throws
+    // (DeveloperError from destroyObject) — the double must be as strict.
+    destroy() {
+      if (this.destroyed) throw new Error('This object was destroyed, i.e., destroy() was called.');
+      this.destroyCalls += 1;
+      this.destroyed = true;
+    },
   };
 }
 
@@ -91,7 +99,14 @@ function makeSeams() {
           primitives: {
             added: [],
             add(c) { this.added.push(c); return c; },
-            remove(c) { this.added = this.added.filter((x) => x !== c); },
+            // Honor Cesium's contract: PrimitiveCollection.remove DESTROYS the
+            // primitive (destroyPrimitives defaults to true) — the real-app
+            // re-run bug lived exactly in this divergence of the old double.
+            remove(c) {
+              const present = this.added.includes(c);
+              this.added = this.added.filter((x) => x !== c);
+              if (present && !c.destroyed) c.destroy();
+            },
             raiseToTop() {},
           },
         },
@@ -287,6 +302,26 @@ test('setFrame reports the beached count to the panel, frame-derived', async () 
   assert.deepEqual(calls.at(-1), [2, 2]);
   controller.setFrame(0);
   assert.deepEqual(calls.at(-1), [0, 0]);
+  controller.dispose();
+});
+
+test('the simulation can be re-run: start → start, and start → dispose → start', async () => {
+  const seams = makeSeams();
+  const collections = [];
+  seams.options.collectionFactory = () => {
+    const c = makeCollection();
+    collections.push(c);
+    return c;
+  };
+  const controller = createDriftController(seams.options);
+
+  assert.equal((await controller.start({ lat: 33.5, lon: -118.5, n: 4 })).ok, true);
+  assert.equal((await controller.start({ lat: 34.0, lon: -119.0, n: 4 })).ok, true, 'second start succeeds');
+  assert.equal(collections[0].destroyCalls, 1, 'first collection destroyed exactly once');
+
+  controller.dispose();
+  assert.equal(collections[1].destroyCalls, 1, 'disposed collection destroyed exactly once');
+  assert.equal((await controller.start({ lat: 33.5, lon: -118.5, n: 4 })).ok, true, 'start after dispose succeeds');
   controller.dispose();
 });
 
