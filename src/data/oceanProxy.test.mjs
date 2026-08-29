@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import {
   normalizeOceanObs,
   buildMarineGridAxes,
+  buildMarineGridParams,
   marineHoursToMs,
   normalizeMarineGridUpstream,
   fetchOceanObs,
@@ -50,6 +51,23 @@ test('buildMarineGridAxes clamps to valid latitude/longitude ranges near the edg
   assert.ok(axes.lons.every((lon) => lon >= -180 && lon <= 180));
   assert.equal(axes.lats.length, 5);
   assert.equal(axes.lons.length, 5);
+});
+
+test('buildMarineGridParams requests 2 forecast days AND 2 past days on both APIs (hindcast forcing)', () => {
+  const axes = buildMarineGridAxes(33.34, -118.33);
+  const { marineParams, windParams, nodeCount } = buildMarineGridParams(axes);
+  assert.equal(nodeCount, 25);
+  for (const params of [marineParams, windParams]) {
+    assert.equal(params.get('forecast_days'), '2');
+    assert.equal(params.get('past_days'), '2');
+    assert.equal(params.get('timezone'), 'UTC');
+    assert.equal(params.get('latitude').split(',').length, 25);
+    assert.equal(params.get('longitude').split(',').length, 25);
+  }
+  assert.equal(marineParams.get('hourly'), 'wave_height,ocean_current_velocity,ocean_current_direction');
+  assert.equal(windParams.get('hourly'), 'wind_speed_10m,wind_direction_10m');
+  assert.equal(windParams.get('wind_speed_unit'), 'ms');
+  assert.equal(marineParams.get('wind_speed_unit'), null);
 });
 
 test('marineHoursToMs converts Open-Meteo ISO hours (UTC, no zone suffix) to epoch ms', () => {

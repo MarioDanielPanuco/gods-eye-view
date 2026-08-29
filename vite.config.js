@@ -7401,6 +7401,41 @@ export function marineHoursToMs(times) {
 }
 
 /**
+ * Build the two Open-Meteo query param sets refreshGrid sends for the drift
+ * forcing grid — one against the marine API, one against the forecast (wind)
+ * API. Nodes are flattened row-major (`latIndex * lons.length + lonIndex`)
+ * into comma-separated coordinate lists.
+ */
+export function buildMarineGridParams(axes) {
+  // Row-major node order: nodes[latIndex * lons.length + lonIndex].
+  const lats = [];
+  const lons = [];
+  for (const lat of axes.lats) {
+    for (const lon of axes.lons) {
+      lats.push(lat);
+      lons.push(lon);
+    }
+  }
+  const shared = {
+    latitude: lats.join(','),
+    longitude: lons.join(','),
+    forecast_days: '2',
+    past_days: '2', // hindcast mode — hourly.time extends 48 h into the past
+    timezone: 'UTC',
+  };
+  const marineParams = new URLSearchParams({
+    ...shared,
+    hourly: 'wave_height,ocean_current_velocity,ocean_current_direction',
+  });
+  const windParams = new URLSearchParams({
+    ...shared,
+    hourly: 'wind_speed_10m,wind_direction_10m',
+    wind_speed_unit: 'ms',
+  });
+  return { marineParams, windParams, nodeCount: lats.length };
+}
+
+/**
  * Zip multi-point marine + wind upstream responses into per-node forcing
  * arrays. Open-Meteo returns an ARRAY for comma-separated coordinate lists
  * (confirmed live 2026-08-28) and a single object for one point — both are
@@ -7532,30 +7567,7 @@ function oceanProxy() {
 
   async function refreshGrid(point, key) {
     const axes = buildMarineGridAxes(point.latitude, point.longitude);
-    // Row-major node order: nodes[latIndex * lons.length + lonIndex].
-    const lats = [];
-    const lons = [];
-    for (const lat of axes.lats) {
-      for (const lon of axes.lons) {
-        lats.push(lat);
-        lons.push(lon);
-      }
-    }
-    const shared = {
-      latitude: lats.join(','),
-      longitude: lons.join(','),
-      forecast_days: '2',
-      timezone: 'UTC',
-    };
-    const marineParams = new URLSearchParams({
-      ...shared,
-      hourly: 'wave_height,ocean_current_velocity,ocean_current_direction',
-    });
-    const windParams = new URLSearchParams({
-      ...shared,
-      hourly: 'wind_speed_10m,wind_direction_10m',
-      wind_speed_unit: 'ms',
-    });
+    const { marineParams, windParams, nodeCount } = buildMarineGridParams(axes);
     const [marineUpstream, windUpstream] = await Promise.all([
       fetchRegionalJson(`https://marine-api.open-meteo.com/v1/marine?${marineParams}`, {
         maxBytes: OCEAN_MAX_RESPONSE_BYTES,
@@ -7566,7 +7578,7 @@ function oceanProxy() {
         timeoutMs: 15_000,
       }),
     ]);
-    const grid = normalizeMarineGridUpstream(marineUpstream, windUpstream, lats.length);
+    const grid = normalizeMarineGridUpstream(marineUpstream, windUpstream, nodeCount);
     if (!grid) throw new Error('Marine grid response shape mismatch');
     const payload = {
       status: 'ready',
