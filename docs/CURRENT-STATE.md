@@ -2271,6 +2271,21 @@ silently demoting every later lookup for the session.
   SAR PRODUCT`. Forcing gaps are zero-filled and flagged `⚠ forcing gaps`;
   forecast currents are coarse model output (no nearshore eddies, tides, or
   Stokes drift), and the visualization makes no operational claim.
+- **Land/sea mask + beaching (August 2026).** A bundled global 1/8°
+  three-state GSHHG-derived raster (`src/data/local_data/gshhg_mask/`,
+  1.04 MB, loader `src/data/landSeaMask.js`) gates ocean-point clicks
+  synchronously: pure land → no card at all; pure water → card + DRIFT chip
+  before any fetch; coastal-mixed cells (~14 km) fall back to the live
+  marine-probe path so the coarse mask never lies. Drift particles beach:
+  the ensemble takes a land tester built from `/api/ocean/etopo` bathymetry
+  (NOAA ETOPO1 via CoastWatch ERDDAP, 2 arc-min stride over a ±1.5° box,
+  7-day cache, stale-forever; `z ≥ 0` ⇒ land) with the bundled bitmask as
+  fallback — a beached particle freezes at its last water position from
+  `beachedAtFrame` onward, recolors to slate (frame-derived, so scrubbing
+  back reverts), never resumes, and the scrub panel counts `⚓ N beached`.
+  Coastal bitmask cells never beach. The no-mask ensemble path is
+  bit-for-bit unchanged (regression-pinned). Mask regeneration:
+  `node scripts/build-land-sea-mask.mjs path/to/gshhs_i.b`.
 
 ### Not Currently in Runtime
 

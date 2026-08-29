@@ -52,7 +52,7 @@ How to read this:
 - **Re:Earth Terrain.** Keyless (no API key). Used two ways: (1) `src/mapStackController.js` swaps in a `Cesium.CesiumTerrainProvider` pointed at Re:Earth's `cesium-mesh/ellipsoid` quantized-mesh endpoint for globe stacks without a Cesium ion token (e.g. OSM), replacing a flat `EllipsoidTerrainProvider`; falls back to the flat provider if the endpoint can't be reached. (2) The server-side `/api/terrain/heights` proxy (disk-cached, serve-stale) resolves per-point ellipsoidal ground height for entity placement. Both are best-effort with a keyless-safe fallback (bundled EGM96 geoid math) if Re:Earth is unreachable.
 - **Global Context installation context.** `/api/military-installations` queries only an allow-listed subset of OSM `military=*` and `landuse=military` features inside a maximum 10° non-dateline viewport. It caches and may serve stale mapped context, but it is neither a global installation database nor evidence of capability, activity, or absence. User-requested Google Places results remain separately sourced candidates unless their returned types explicitly establish military classification; generic offices, museums, and similarly ambiguous matches are excluded from military proximity counts.
 - **Cockpit regional briefing.** `/api/regional-brief` rounds aircraft coordinates into 0.1° cache cells, caches results for five minutes, and serializes Nominatim calls at no more than one request per second. Google News RSS is queried with the resolved locality/region first; GDELT is used only when that RSS query fails or is empty. Google's published Google News terms restrict that source to personal, noncommercial use, so commercial deployments must disable/replace it or obtain separate permission; GDELT permits commercial dataset use with citation. The Data attribution popover identifies the active headline sources; article links retain publisher attribution. Headlines are location-query matches, not verified incidents, risk rankings, or evidence that a location is safe. Empty, partial, stale, and unavailable source states remain distinct. Open-Meteo supplies current conditions independently of the news source. `WX OFF` disables cockpit weather rendering only; the Local Info briefing still fetches its source-backed weather values and displays the required linked Open-Meteo credit.
-- **Ocean conditions + drift simulation.** `/api/ocean/obs` fetches NOAA NDBC's bulk latest-observations file server-side on a 10-minute cache (60-minute stale window) and joins station names from a 24-hour-cached `activestations.xml` — the browser only ever sees normalized JSON, and a missing field renders nothing rather than an interpolated guess. NDBC values are **station observations**, not a modeled sea-state field. `/api/ocean/marine` (0.1° cache cells, 15 min TTL) and `/api/ocean/marine-grid` (5×5 × 0.5° forecast grid for the drift simulator, 30 min TTL) supply Open-Meteo Marine and Open-Meteo forecast values, which are **model forecasts** distinct from NDBC observations and are labeled `FC` on cards. The drift ensemble is labeled `SIMULATED DRIFT ENSEMBLE — NOT A SAR PRODUCT`: coarse forecast currents resolve no nearshore eddies or tidal flow, the MVP has no Stokes drift term, and the output is a probabilistic visualization, not search-and-rescue guidance. One truncated point-in-time NDBC capture is committed as a parser-test fixture (`src/data/fixtures/ndbc-latest-obs-sample.txt`, U.S. public domain, never served to the app).
+- **Ocean conditions + drift simulation.** `/api/ocean/obs` fetches NOAA NDBC's bulk latest-observations file server-side on a 10-minute cache (60-minute stale window) and joins station names from a 24-hour-cached `activestations.xml` — the browser only ever sees normalized JSON, and a missing field renders nothing rather than an interpolated guess. NDBC values are **station observations**, not a modeled sea-state field. `/api/ocean/marine` (0.1° cache cells, 15 min TTL) and `/api/ocean/marine-grid` (5×5 × 0.5° forecast grid for the drift simulator, 30 min TTL) supply Open-Meteo Marine and Open-Meteo forecast values, which are **model forecasts** distinct from NDBC observations and are labeled `FC` on cards. `/api/ocean/etopo` supplies NOAA ETOPO1 bathymetry (CoastWatch ERDDAP `etopo180`, U.S. public domain) at 2 arc-min stride over a ±1.5° box for drift beaching — 7-day cache with stale-forever fallback, and the bundled GSHHG mask takes over when it is unreachable, so beaching merely coarsens instead of vanishing. The drift ensemble is labeled `SIMULATED DRIFT ENSEMBLE — NOT A SAR PRODUCT`: coarse forecast currents resolve no nearshore eddies or tidal flow, the MVP has no Stokes drift term, and the output is a probabilistic visualization, not search-and-rescue guidance. Point-in-time captures committed as parser-test fixtures (`src/data/fixtures/ndbc-latest-obs-sample.txt`, `src/data/fixtures/etopo-sample.json`, both U.S. public domain, never served to the app).
 - **Dynamic weather presentation.** While cockpit mode is active, `/api/weather-effects` requests current Open-Meteo observations for the aircraft/camera location, rounds coordinates into 0.1° cache cells, caches results for five minutes, and may retain a stale observation for up to 30 minutes during a transient outage. WMO condition code selects the visual family; observed cloud cover, precipitation, visibility, wind speed, and wind direction bound its strength and motion. Missing or expired weather renders no synthetic atmospheric effect, and normal globe view never renders the weather overlay.
 
 ---
@@ -68,6 +68,7 @@ Static datasets shipped in the repo for an out-of-the-box experience. **None are
 | **TeleGeography Submarine Cable Map** (712 cables + 1,917 landing points) | `telegeography_submarine_cables/` | **CC BY-NC-SA 3.0** | ❌ **NonCommercial — remove for commercial use** | "© TeleGeography — submarinecablemap.com" |
 | **Natural Earth physical regions** (1,046 land + 292 marine named polygons) | `natural_earth/` | **Public domain** | ✅ (no restrictions) | "Made with Natural Earth" (courtesy credit — not legally required) |
 | **DataSF Analysis Neighborhoods** (41 SF neighborhood polygons) | `neighborhoods/` | **PDDL 1.0** (public domain) | ✅ (no restrictions) | "City & County of San Francisco — DataSF" (courtesy — not legally required) |
+| **GSHHG land/sea mask** (global 1/8° three-state raster, 1.04 MB) | `gshhg_mask/` | **LGPL-3.0** (derived work; regeneration script committed) | ✅ (attribution + LGPL terms on the data) | "Wessel & Smith, GSHHG" |
 
 ### ⚠️ TeleGeography is bundled but NonCommercial
 
@@ -116,6 +117,24 @@ Natural Earth is **public domain** (no permission needed, no attribution legally
 https://www.naturalearthdata.com/about/terms-of-use/). We credit anyway: "Made with Natural
 Earth". Registration in the in-app `dataCredits.js` attribution list ships with the resolver
 wiring (see below).
+
+### GSHHG land/sea mask (`gshhg_mask/`)
+
+A global 1/8° three-state raster (water / land / coastal-mixed, 2 bits per cell,
+1,036,816 bytes) derived from **GSHHG v2.3.7** intermediate-resolution coastline
+polygons (Wessel & Smith — https://www.soest.hawaii.edu/pwessel/gshhg/, fetched
+2026-08-29; `gshhs_i.b` SHA-256 in the folder README). It gates ocean-point
+clicks in the Ocean Conditions layer (land clicks produce nothing; coastal cells
+fall back to the live marine-forecast probe so a ~14 km cell never lies) and is
+the drift simulator's beaching fallback when ETOPO bathymetry is unavailable.
+Composition: L1 land, L2 lakes carved back to water (the Great Lakes have NDBC
+buoys), L3 islands-in-lakes land, L4 ponds water, L5 Antarctic ice front land,
+L6 grounding line skipped. Regeneration is deterministic and committed:
+`node scripts/build-land-sea-mask.mjs path/to/gshhs_i.b`.
+
+GSHHG is distributed under the **LGPL**; this raster is a derived work of the
+data and keeps that license (see the carve-out in [LICENSE](LICENSE)). Credit:
+"Wessel & Smith, GSHHG", registered in `dataCredits.js`.
 
 ### DataSF Analysis Neighborhoods (`neighborhoods/`)
 

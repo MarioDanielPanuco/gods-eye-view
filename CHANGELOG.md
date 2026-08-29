@@ -18,6 +18,14 @@ of current runtime behavior, see [`docs/CURRENT-STATE.md`](docs/CURRENT-STATE.md
   Open-Meteo forecast grid, rendered as a scrubbable particle cloud labeled
   `SIMULATED DRIFT ENSEMBLE — NOT A SAR PRODUCT`, started from a `▶ DRIFT`
   chip on buoy and ocean-point cards.
+- Added a bundled global land/sea mask (GSHHG-derived, 1/8°, three-state)
+  that gates ocean clicks instantly — land clicks produce nothing, water
+  clicks get their card and DRIFT chip before any network round-trip, and
+  coastal cells keep the honest live-probe fallback.
+- Added drift-particle beaching: ETOPO bathymetry (2 arc-min, `z ≥ 0` ⇒
+  land, with the bundled mask as offline fallback) freezes particles at
+  their last water position, recolors them, and the scrub panel reports
+  `⚓ N beached`.
 
 ## [Unreleased] — 2026-08-24
 
