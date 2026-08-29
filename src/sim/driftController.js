@@ -34,7 +34,80 @@ export const DRIFT_DEFAULTS = Object.freeze({
   horizonH: 24,
   dtMin: 10,
   posSigmaM: 150,
+  sigmaTurbMs: 0.05,
 });
+
+/** Hard particle cap enforced by {@link resolveDriftParams}. */
+const DRIFT_MAX_PARTICLES = 25000;
+/** Frame-buffer ceiling: n · frames · 2 float32 (= 8 B) must stay below it. */
+const DRIFT_FRAME_BUDGET_BYTES = 32 * 1024 * 1024;
+
+/**
+ * Validate/complete a user-facing drift parameter set into the full set the
+ * model run needs. dtMin is DERIVED, never user-set: 10 min below 48 h and
+ * 20 min at 48 h keeps the frame count at 60·horizonH/dtMin + 1 ≤ 145.
+ * Budget arithmetic: each frame stores 2 float32 per particle (8 B), so the
+ * transferable frame buffer is n · frames · 8 B; the worst offered combo
+ * (n = 25000, horizonH = 48 → 145 frames) is 25000·145·8 = 29 MB, under the
+ * 32 MB ceiling. n is clamped to 25000 and the ceiling is asserted so no
+ * parameter drift can silently blow the budget.
+ * @param {Object} [overrides]
+ * @param {number} [overrides.horizonH] Simulation horizon, hours.
+ * @param {number} [overrides.n] Ensemble size (clamped to [1, 25000]).
+ * @param {number} [overrides.sigmaTurbMs] Turbulent-diffusion σ, m/s.
+ * @param {boolean} [overrides.backward] Reverse (hindcast) drift.
+ * @returns {{horizonH: number, dtMin: number, n: number, sigmaTurbMs: number, backward: boolean}}
+ */
+export function resolveDriftParams({
+  horizonH = DRIFT_DEFAULTS.horizonH,
+  n = DRIFT_DEFAULTS.n,
+  sigmaTurbMs = DRIFT_DEFAULTS.sigmaTurbMs,
+  backward = false,
+} = {}) {
+  const clampedN = Math.min(DRIFT_MAX_PARTICLES, Math.max(1, Math.floor(n)));
+  const dtMin = horizonH >= 48 ? 20 : 10;
+  const frameCount = Math.round((60 * horizonH) / dtMin) + 1;
+  const bytes = clampedN * frameCount * 8;
+  if (bytes >= DRIFT_FRAME_BUDGET_BYTES) {
+    throw new Error(`drift frame buffer ${bytes} B exceeds the ${DRIFT_FRAME_BUDGET_BYTES} B budget`);
+  }
+  return { horizonH, dtMin, n: clampedN, sigmaTurbMs, backward: Boolean(backward) };
+}
+
+const EARTH_RADIUS_KM = 6371;
+const DEG = Math.PI / 180;
+
+/**
+ * Haversine great-circle distance plus initial bearing from (lat1, lon1)
+ * to (lat2, lon2). Bearing is degrees clockwise from true north in [0, 360).
+ * @returns {{km: number, bearingDeg: number}}
+ */
+function driftVector(lat1, lon1, lat2, lon2) {
+  const p1 = lat1 * DEG;
+  const p2 = lat2 * DEG;
+  const dp = (lat2 - lat1) * DEG;
+  const dl = (lon2 - lon1) * DEG;
+  const a = Math.sin(dp / 2) ** 2 + Math.cos(p1) * Math.cos(p2) * Math.sin(dl / 2) ** 2;
+  const km = 2 * EARTH_RADIUS_KM * Math.asin(Math.min(1, Math.sqrt(a)));
+  const y = Math.sin(dl) * Math.cos(p2);
+  const x = Math.cos(p1) * Math.sin(p2) - Math.sin(p1) * Math.cos(p2) * Math.cos(dl);
+  const bearingDeg = ((Math.atan2(y, x) / DEG) + 360) % 360;
+  return { km, bearingDeg };
+}
+
+/**
+ * Panel diagnostics line for a run result, or null when the model did not
+ * report mean-endpoint fields (stubs and older workers may omit them).
+ * @param {number} seedLat @param {number} seedLon @param {Object} result
+ * @returns {?string} e.g. `Δ 10.0 km @ 90° · ± 3.2 km spread`
+ */
+function summarizeResult(seedLat, seedLon, result) {
+  if (!Number.isFinite(result?.meanEndLat) || !Number.isFinite(result?.meanEndLon)) return null;
+  const { km, bearingDeg } = driftVector(seedLat, seedLon, result.meanEndLat, result.meanEndLon);
+  let text = `Δ ${km.toFixed(1)} km @ ${Math.round(bearingDeg) % 360}°`;
+  if (Number.isFinite(result.spreadKm)) text += ` · ± ${result.spreadKm.toFixed(1)} km spread`;
+  return text;
+}
 
 const PARTICLE_COLOR = Cesium.Color.fromCssColorString('#ffb14d');
 const BEACHED_COLOR = Cesium.Color.fromCssColorString('#9fb8c8');
@@ -141,7 +214,7 @@ function runEnsembleInWorker(params) {
  * @param {Function} [options.collectionFactory] Injectable point-collection factory (tests).
  * @param {Function} [options.panelFactory] Injectable scrub-panel factory (tests).
  * @param {Function} [options.maskLoaderFn] Injectable bundled-bitmask loader (tests).
- * @returns {{start: Function, setFrame: Function, play: Function, pause: Function, dispose: Function, isActive: Function}}
+ * @returns {{start: Function, rerun: Function, setFrame: Function, play: Function, pause: Function, dispose: Function, isActive: Function}}
  */
 export function createDriftController({
   viewer,
@@ -153,6 +226,8 @@ export function createDriftController({
   maskLoaderFn = loadLandSeaMask,
 } = {}) {
   let _active = null; // {collection, points, timesMs, frames, beachedAtFrame, n, frameIndex, panel, playTimer}
+  let _lastSeed = null; // {lat, lon, label} of the most recent start()
+  let _lastParams = null; // {horizonH, n, sigmaTurbMs, backward} resolved for it
 
   function dispose() {
     if (!_active) return;
@@ -213,9 +288,20 @@ export function createDriftController({
   /**
    * Start a drift simulation at an ocean point. Returns `{ok, reason?}` —
    * the caller owns telling the user when forcing is unavailable.
+   * Parameter overrides {horizonH, n, sigmaTurbMs, backward} are resolved
+   * through {@link resolveDriftParams} (dtMin is derived from the horizon);
+   * the seed and resolved params are remembered for {@link rerun}.
    */
-  async function start({ lat, lon, label = '', n = DRIFT_DEFAULTS.n, horizonH = DRIFT_DEFAULTS.horizonH, dtMin = DRIFT_DEFAULTS.dtMin } = {}) {
+  async function start({ lat, lon, label = '', horizonH, n, sigmaTurbMs, backward } = {}) {
     dispose();
+    const runParams = resolveDriftParams({ horizonH, n, sigmaTurbMs, backward });
+    _lastSeed = { lat, lon, label };
+    _lastParams = {
+      horizonH: runParams.horizonH,
+      n: runParams.n,
+      sigmaTurbMs: runParams.sigmaTurbMs,
+      backward: runParams.backward,
+    };
     const params = new URLSearchParams({ latitude: lat.toFixed(4), longitude: lon.toFixed(4) });
     // Grid is required; ETOPO bathymetry only upgrades beaching resolution.
     const [gridSettled, etopoSettled] = await Promise.allSettled([
@@ -247,12 +333,14 @@ export function createDriftController({
     let result;
     try {
       result = await runEnsembleFn({
-        n,
+        n: runParams.n,
         seedLat: lat,
         seedLon: lon,
         startTimeMs: Date.now(),
-        horizonH,
-        dtMin,
+        horizonH: runParams.horizonH,
+        dtMin: runParams.dtMin,
+        sigmaTurbMs: runParams.sigmaTurbMs,
+        backward: runParams.backward,
         grid,
         landMask,
         rngSeed: Date.now() >>> 0,
@@ -284,13 +372,16 @@ export function createDriftController({
       particleCount: result.n,
       classLabel: 'PIW — person in water',
       frameCount: result.timesMs.length,
-      horizonH,
+      horizonH: runParams.horizonH,
       degraded: Boolean(result.degraded),
       label,
+      params: { ..._lastParams },
+      onRerun: (overrides) => rerun(overrides),
       onScrub: (index) => { pause(); setFrame(index); },
       onPlayPause: () => (_active?.playTimer ? pause() : play()),
       onClose: () => dispose(),
     });
+    panel?.setSummary?.(summarizeResult(lat, lon, result));
 
     _active = {
       collection,
@@ -314,7 +405,8 @@ export function createDriftController({
       collisionGroup: 'ambient-card',
       priority: Number.MAX_SAFE_INTEGER,
       title: 'SIMULATED DRIFT ENSEMBLE',
-      details: [`${result.n.toLocaleString()} particles · ${horizonH} h · PIW`,
+      details: [`${result.n.toLocaleString()} particles · ${runParams.horizonH} h · PIW`,
+        ...(runParams.backward ? ['REVERSE DRIFT — origin hypothesis'] : []),
         ...(result.degraded ? ['⚠ forcing gaps zero-filled'] : [])],
       accent: '#ffb14d',
       interactive: false,
@@ -329,8 +421,20 @@ export function createDriftController({
     return { ok: true };
   }
 
+  /**
+   * Dispose the current run and start again at the REMEMBERED seed with the
+   * remembered params merged under `paramOverrides` (start() itself disposes
+   * first). Returns `{ok: false}` when nothing has been started yet.
+   * @param {Object} [paramOverrides] Subset of {horizonH, n, sigmaTurbMs, backward}.
+   */
+  async function rerun(paramOverrides = {}) {
+    if (!_lastSeed) return { ok: false, reason: 'no prior simulation to re-run' };
+    return start({ ..._lastSeed, ..._lastParams, ...paramOverrides });
+  }
+
   return {
     start,
+    rerun,
     setFrame,
     play,
     pause,

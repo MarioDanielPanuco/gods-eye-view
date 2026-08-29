@@ -5,9 +5,11 @@ import {
   normalizeForcingGrid,
   frameForTime,
   createDriftController,
+  resolveDriftParams,
   DRIFT_OVERLAY_SOURCE_ID,
   DRIFT_DEFAULTS,
 } from './driftController.js';
+import { createDriftPanel } from './driftPanel.js';
 
 const HOURS = [Date.UTC(2026, 7, 29, 0, 0), Date.UTC(2026, 7, 29, 1, 0)];
 
@@ -84,13 +86,17 @@ function makeCollection() {
 function makeSeams() {
   const overlayCalls = [];
   const collection = makeCollection();
-  const panel = { frames: [], destroyed: false };
+  const panel = { frames: [], frameArgs: [], summaries: [], destroyed: false };
   const seams = {
     overlayCalls,
     collection,
     panel,
+    // Options the injected panelFactory last received (params/onRerun assertions).
+    panelOptions: null,
     // Params the injected runEnsembleFn last received (landMask assertions).
     ensembleParams: null,
+    // Total runEnsembleFn invocations (rerun assertions).
+    ensembleRuns: 0,
     // Per-test ETOPO response; default 503 so the bitmask fallback engages.
     etopoResponse: async () => ({ ok: false, status: 503 }),
     options: {
@@ -122,7 +128,9 @@ function makeSeams() {
       maskLoaderFn: async () => ({ width: 4, height: 2, data: new Uint8Array([0b01, 0]) }),
       runEnsembleFn: async (params) => {
         seams.ensembleParams = params;
-        // Two frames, params.n particles, all at the seed.
+        seams.ensembleRuns += 1;
+        // Two frames, params.n particles, all at the seed. Backward runs
+        // have DECREASING timesMs per the model contract.
         const n = params.n;
         const frames = new Float32Array(2 * n * 2);
         for (let t = 0; t < 2; t += 1) {
@@ -131,14 +139,22 @@ function makeSeams() {
             frames[(t * n + i) * 2 + 1] = params.seedLat;
           }
         }
-        return { timesMs: Float64Array.from(HOURS), frames, n, degraded: false };
+        const timesMs = Float64Array.from(params.backward ? [HOURS[1], HOURS[0]] : HOURS);
+        return { timesMs, frames, n, degraded: false };
       },
       collectionFactory: () => collection,
-      panelFactory: () => ({
-        setFrame: (i) => panel.frames.push(i),
-        setPlaying: () => {},
-        destroy: () => { panel.destroyed = true; },
-      }),
+      panelFactory: (options) => {
+        seams.panelOptions = options;
+        return {
+          setFrame: (i, offsetMs, beachedCount) => {
+            panel.frames.push(i);
+            panel.frameArgs.push([i, offsetMs, beachedCount]);
+          },
+          setPlaying: () => {},
+          setSummary: (text) => panel.summaries.push(text),
+          destroy: () => { panel.destroyed = true; },
+        };
+      },
     },
   };
   return seams;
@@ -329,4 +345,142 @@ test('defaults respect the frame-buffer memory budget', () => {
   // n · (60·horizonH/dtMin + 1) · 2 · 4 bytes — must stay ≈ tens of MB.
   const frames = DRIFT_DEFAULTS.n * (60 * DRIFT_DEFAULTS.horizonH / DRIFT_DEFAULTS.dtMin + 1) * 2 * 4;
   assert.ok(frames < 32 * 1024 * 1024, `frame buffer ${frames} bytes exceeds 32 MB`);
+});
+
+test('resolveDriftParams fills defaults and derives dtMin from the horizon', () => {
+  const p = resolveDriftParams({});
+  assert.equal(p.horizonH, DRIFT_DEFAULTS.horizonH);
+  assert.equal(p.dtMin, 10);
+  assert.equal(p.n, DRIFT_DEFAULTS.n);
+  assert.equal(p.sigmaTurbMs, DRIFT_DEFAULTS.sigmaTurbMs);
+  assert.equal(DRIFT_DEFAULTS.sigmaTurbMs, 0.05);
+  assert.equal(p.backward, false);
+  // dt auto-scaling: 20 min at 48 h keeps the frame count at 145; 10 min below.
+  assert.equal(resolveDriftParams({ horizonH: 6 }).dtMin, 10);
+  assert.equal(resolveDriftParams({ horizonH: 24 }).dtMin, 10);
+  assert.equal(resolveDriftParams({ horizonH: 48 }).dtMin, 20);
+});
+
+test('resolveDriftParams clamps n and every offered combo stays inside the 32 MB budget', () => {
+  assert.equal(resolveDriftParams({ n: 90000 }).n, 25000);
+  // n · frames · 8 B (2 float32 per particle per frame); worst offered combo
+  // 25000 · 145 · 8 = 29 MB < 32 MB.
+  for (const horizonH of [6, 12, 24, 48]) {
+    const p = resolveDriftParams({ horizonH, n: 25000 });
+    const frameCount = 60 * p.horizonH / p.dtMin + 1;
+    assert.ok(p.n * frameCount * 8 < 32 * 1024 * 1024,
+      `horizon ${horizonH} h: ${p.n * frameCount * 8} bytes exceeds 32 MB`);
+  }
+});
+
+test('start passes sigmaTurbMs and backward through to the ensemble runner', async () => {
+  const seams = makeSeams();
+  const controller = createDriftController(seams.options);
+  await controller.start({ lat: 33.5, lon: -118.5, n: 8, sigmaTurbMs: 0.1, backward: true });
+  assert.equal(seams.ensembleParams.sigmaTurbMs, 0.1);
+  assert.equal(seams.ensembleParams.backward, true);
+  controller.dispose();
+});
+
+test('rerun reuses the remembered seed with merged params and disposes the prior run', async () => {
+  const seams = makeSeams();
+  const collections = [];
+  seams.options.collectionFactory = () => {
+    const c = makeCollection();
+    collections.push(c);
+    return c;
+  };
+  const controller = createDriftController(seams.options);
+  assert.equal((await controller.rerun()).ok, false, 'rerun before any start reports failure');
+
+  await controller.start({ lat: 33.5, lon: -118.5, label: 'seed', n: 8, sigmaTurbMs: 0.1 });
+  const result = await controller.rerun({ horizonH: 48, n: 4 });
+  assert.equal(result.ok, true);
+  assert.equal(seams.ensembleParams.seedLat, 33.5, 'seed remembered');
+  assert.equal(seams.ensembleParams.seedLon, -118.5, 'seed remembered');
+  assert.equal(seams.ensembleParams.horizonH, 48);
+  assert.equal(seams.ensembleParams.dtMin, 20, 'dtMin re-derived for the new horizon');
+  assert.equal(seams.ensembleParams.n, 4);
+  assert.equal(seams.ensembleParams.sigmaTurbMs, 0.1, 'unoverridden params carry over');
+  assert.equal(collections[0].destroyCalls, 1, 'prior collection destroyed exactly once');
+  controller.dispose();
+  assert.equal(collections[1].destroyCalls, 1);
+});
+
+test('the panel factory receives control-facing params and a working onRerun', async () => {
+  const seams = makeSeams();
+  const controller = createDriftController(seams.options);
+  await controller.start({ lat: 33.5, lon: -118.5, n: 8 });
+  assert.deepEqual(seams.panelOptions.params, {
+    horizonH: DRIFT_DEFAULTS.horizonH,
+    n: 8,
+    sigmaTurbMs: DRIFT_DEFAULTS.sigmaTurbMs,
+    backward: false,
+  });
+  assert.equal(typeof seams.panelOptions.onRerun, 'function');
+
+  const runsBefore = seams.ensembleRuns;
+  const result = await seams.panelOptions.onRerun({ horizonH: 12, n: 4, sigmaTurbMs: 0, backward: true });
+  assert.equal(result.ok, true);
+  assert.equal(seams.ensembleRuns, runsBefore + 1, 'onRerun triggers a second ensemble run');
+  assert.equal(seams.ensembleParams.horizonH, 12);
+  assert.equal(seams.ensembleParams.n, 4);
+  assert.equal(seams.ensembleParams.sigmaTurbMs, 0);
+  assert.equal(seams.ensembleParams.backward, true);
+  controller.dispose();
+});
+
+test('setSummary receives a km summary when the result carries mean drift and spread', async () => {
+  const seams = makeSeams();
+  const base = seams.options.runEnsembleFn;
+  seams.options.runEnsembleFn = async (params) => ({
+    ...(await base(params)),
+    meanEndLat: 33.5,
+    // ≈ 10 km due east of the seed at 33.5°N → initial bearing ≈ 90°.
+    meanEndLon: -118.392,
+    spreadKm: 3.2,
+  });
+  const controller = createDriftController(seams.options);
+  await controller.start({ lat: 33.5, lon: -118.5, n: 4 });
+  const summary = seams.panel.summaries.at(-1);
+  assert.equal(typeof summary, 'string');
+  assert.match(summary, /km/);
+  assert.match(summary, /@ 90°/);
+  assert.match(summary, /± 3\.2 km/);
+  controller.dispose();
+});
+
+test('setSummary receives null when the stub result carries no mean-drift fields', async () => {
+  const seams = makeSeams();
+  const controller = createDriftController(seams.options);
+  await controller.start({ lat: 33.5, lon: -118.5, n: 4 });
+  assert.equal(seams.panel.summaries.at(-1), null);
+  controller.dispose();
+});
+
+test('a backward run labels the banner REVERSE and reports negative clock offsets', async () => {
+  const seams = makeSeams();
+  const controller = createDriftController(seams.options);
+  await controller.start({ lat: 33.5, lon: -118.5, n: 4, backward: true });
+
+  const banner = seams.overlayCalls.find(([kind, sourceId]) => kind === 'entries' && sourceId === DRIFT_OVERLAY_SOURCE_ID);
+  assert.ok(banner, 'banner published');
+  assert.match(banner[2][0].title, /SIMULATED DRIFT ENSEMBLE/);
+  assert.ok(banner[2][0].details.some((line) => /REVERSE/.test(line)), 'details flag the reverse run');
+
+  controller.setFrame(1);
+  const [index, offsetMs] = seams.panel.frameArgs.at(-1);
+  assert.equal(index, 1);
+  assert.ok(offsetMs < 0, 'backward frames report negative offsets so the panel renders T−hh:mm');
+  controller.dispose();
+});
+
+test('createDriftPanel headless stub keeps the full no-op shape including setSummary', () => {
+  const stub = createDriftPanel({
+    params: { horizonH: 24, n: 10000, sigmaTurbMs: 0.05, backward: false },
+    onRerun: () => {},
+  });
+  for (const key of ['setFrame', 'setPlaying', 'setSummary', 'destroy']) {
+    assert.equal(typeof stub[key], 'function', `stub exposes ${key}`);
+  }
 });
