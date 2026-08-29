@@ -2286,6 +2286,21 @@ silently demoting every later lookup for the session.
   Coastal bitmask cells never beach. The no-mask ensemble path is
   bit-for-bit unchanged (regression-pinned). Mask regeneration:
   `node scripts/build-land-sea-mask.mjs path/to/gshhs_i.b`.
+- **Drift numerics + parameters (August 2026).** Integration is classical
+  RK4 (four forcing samples per step, per-stage latitude metric;
+  convergence-pinned against a closed-form latitude-varying trajectory at
+  1e-9 where Euler misses by ~1e-3 deg). Per-step turbulent diffusion
+  (`sigmaTurbMs`, default 0.05 m/s) adds N(0, σ) velocity noise per
+  particle per step; particle 0 is a deterministic control track (no
+  scatter, no residuals, no crosswind, no jibe, no noise) whose RNG draws
+  are consumed-and-discarded so the perturbed streams stay bit-stable.
+  Backward mode integrates with negative dt over a forcing grid that now
+  includes `past_days=2`; results carry `meanEndLat/meanEndLon/spreadKm`.
+  The scrub panel exposes horizon (6/12/24/48 h; dt auto-derives 10/20 min
+  to hold ≤145 frames), particle count (≤25,000; 32 MB frame-buffer budget
+  asserted in `resolveDriftParams`), turbulence σ, direction, and RERUN
+  (same seed, merged params); a diagnostics line shows
+  `Δ km @ bearing · ± spread`.
 
 ### Not Currently in Runtime
 

@@ -26,6 +26,21 @@ of current runtime behavior, see [`docs/CURRENT-STATE.md`](docs/CURRENT-STATE.md
   land, with the bundled mask as offline fallback) freezes particles at
   their last water position, recolors them, and the scrub panel reports
   `⚓ N beached`.
+- Upgraded the drift integrator from forward Euler to classical RK4
+  (convergence-tested against closed-form trajectories), added a per-step
+  turbulent-diffusion term, a deterministic control particle (particle 0:
+  unperturbed best-estimate track), and mean-drift/spread diagnostics.
+- Added a drift parameter window: horizon (6/12/24/48 h), particle count,
+  turbulence σ, FORECAST/HINDCAST direction, and a RERUN button that
+  re-runs the same seed with new parameters. Backward (hindcast) runs are
+  labeled `REVERSE DRIFT — origin hypothesis` and clock as `T−hh:mm`; the
+  forcing grid now carries 48 h of past hours to feed them.
+
+### Fixed
+
+- The drift simulation can run more than once: disposing a run no longer
+  destroys its particle collection twice (Cesium's `PrimitiveCollection`
+  destroys on `remove`), which had bricked every start after the first.
 
 ## [Unreleased] — 2026-08-24
 
