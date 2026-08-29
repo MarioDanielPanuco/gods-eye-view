@@ -10,8 +10,10 @@ import {
   oceanToDirToUV,
   perStepJibeProbability,
   makeForcingSampler,
+  makeLandTester,
   runEnsemble,
 } from './leeway.js';
+import { packMaskStates, MASK_WATER, MASK_LAND, MASK_COASTAL } from '../data/landSeaMaskCodec.js';
 
 /** Uniform 2x2x2 forcing grid: constant current + wind everywhere. */
 function constantGrid({ curU = 0, curV = 0, windU = 0, windV = 0 } = {}) {
@@ -166,6 +168,142 @@ test('crosswind spreads symmetrically and jibing tightens the crosswind spread',
   assert.ok(Math.abs(meanEastM) < 200, `mean east ${meanEastM.toFixed(0)} m`);
   // Rapid jibing decorrelates the crosswind sign → tighter spread.
   assert.ok(spreadEast(fastJibe).sd < still.sd * 0.7, 'jibing must shrink crosswind dispersion');
+});
+
+/**
+ * Bathymetry landMask: 3 lats x 5 lons, uniform spacing, z >= 0 means land.
+ * Columns at lon >= -118.4 are land (a wall east of the seed) unless zLand
+ * overrides the per-cell depth outright.
+ */
+function bathyWall({ zWater = -50, zLand = 0, allZ = null } = {}) {
+  const lats = [33.4, 33.5, 33.6];
+  const lons = [-118.5, -118.45, -118.4, -118.35, -118.3];
+  const z = new Float64Array(lats.length * lons.length);
+  for (let r = 0; r < lats.length; r += 1) {
+    for (let c = 0; c < lons.length; c += 1) {
+      z[r * lons.length + c] = allZ !== null ? allZ : (lons[c] >= -118.4 ? zLand : zWater);
+    }
+  }
+  return { type: 'bathy', lats, lons, z };
+}
+
+/** Uniform-state packed bitmask landMask covering the whole globe coarsely. */
+function uniformMask(state, width = 8, height = 4) {
+  const states = new Uint8Array(width * height).fill(state);
+  return { type: 'mask', width, height, data: packMaskStates(states) };
+}
+
+const WALL_OPTIONS = {
+  n: 32, seedLat: 33.5, seedLon: -118.5,
+  startTimeMs: Date.UTC(2026, 7, 29, 0, 0), horizonH: 6, dtMin: 10,
+  grid: constantGrid({ curU: 0.5 }), rngSeed: 77, posSigmaM: 10,
+};
+
+test('no-mask frames are bit-identical to the pre-beaching baseline and beachedAtFrame is all -1', () => {
+  // Baseline captured by running the pre-change runEnsemble on this exact
+  // scenario (scratch script, 2026-08-29). Any drift here means the step
+  // loop's arithmetic changed — the no-mask path must stay byte-identical.
+  const nodes = 4;
+  const hours = 2;
+  const fill = (v) => Float32Array.from({ length: nodes * hours }, () => v);
+  const grid = {
+    lats: [33, 34], lons: [-119, -118],
+    hoursMs: [Date.UTC(2026, 7, 29, 0, 0), Date.UTC(2026, 7, 30, 0, 0)],
+    currentU: fill(0.3), currentV: fill(-0.1), windU: fill(3), windV: fill(8),
+  };
+  const options = {
+    n: 8, seedLat: 33.5, seedLon: -118.5,
+    startTimeMs: Date.UTC(2026, 7, 29, 0, 0), horizonH: 2, dtMin: 10,
+    grid, rngSeed: 1234,
+  };
+  const omitted = runEnsemble(options);
+  assert.equal(omitted.frames.length, 208);
+  const baseline = [
+    [0, -118.49951934814453],
+    [1, 33.49940490722656],
+    [16, -118.49752044677734],
+    [17, 33.5006103515625],
+    [100, -118.48316955566406],
+    [101, 33.498687744140625],
+    [206, -118.47135925292969],
+    [207, 33.49552917480469],
+  ];
+  for (const [k, value] of baseline) assert.equal(omitted.frames[k], value);
+  assert.ok(omitted.beachedAtFrame instanceof Int32Array);
+  assert.equal(omitted.beachedAtFrame.length, options.n);
+  for (const value of omitted.beachedAtFrame) assert.equal(value, -1);
+  const explicitNull = runEnsemble({ ...options, landMask: null });
+  assert.deepEqual(Array.from(explicitNull.frames), Array.from(omitted.frames));
+});
+
+test('makeLandTester bathy: z >= 0 is land, z = -0.5 is water, nearest-cell clamped', () => {
+  const isLand = makeLandTester(bathyWall());
+  assert.equal(isLand(33.5, -118.5), false);
+  assert.equal(isLand(33.5, -118.35), true);
+  // Nearest cell: -118.43 rounds to the -118.45 water column; -118.42 to -118.4 land.
+  assert.equal(isLand(33.5, -118.43), false);
+  assert.equal(isLand(33.5, -118.42), true);
+  // Clamped outside the grid to the nearest edge cell.
+  assert.equal(isLand(90, -140), false);
+  assert.equal(isLand(-90, 170), true);
+  // z = -0.5 is water; z = 0 is land (the >= 0 rule exactly).
+  assert.equal(makeLandTester(bathyWall({ allZ: -0.5 }))(33.5, -118.35), false);
+  assert.equal(makeLandTester(bathyWall({ allZ: 0 }))(33.5, -118.5), true);
+});
+
+test('makeLandTester mask: land only when the cell state is MASK_LAND', () => {
+  assert.equal(makeLandTester(uniformMask(MASK_LAND))(33.5, -118.5), true);
+  assert.equal(makeLandTester(uniformMask(MASK_WATER))(33.5, -118.5), false);
+  assert.equal(makeLandTester(uniformMask(MASK_COASTAL))(33.5, -118.5), false);
+  assert.equal(makeLandTester(null), null);
+});
+
+test('bathy wall: particles beach at their last water position and stay frozen forever', () => {
+  const result = runEnsemble({ ...WALL_OPTIONS, landMask: bathyWall() });
+  const isLand = makeLandTester(bathyWall());
+  const n = WALL_OPTIONS.n;
+  const T = result.timesMs.length;
+  for (let i = 0; i < n; i += 1) {
+    const b = result.beachedAtFrame[i];
+    assert.ok(b >= 1 && b < T, `particle ${i} must beach (got ${b})`);
+    const lastWater = (b - 1) * n * 2 + i * 2;
+    const frozenLon = result.frames[lastWater];
+    const frozenLat = result.frames[lastWater + 1];
+    // Frozen position is the last WATER position, never a land cell.
+    assert.equal(isLand(frozenLat, frozenLon), false);
+    for (let f = b; f < T; f += 1) {
+      const off = f * n * 2 + i * 2;
+      assert.equal(result.frames[off], frozenLon, `particle ${i} lon frame ${f}`);
+      assert.equal(result.frames[off + 1], frozenLat, `particle ${i} lat frame ${f}`);
+    }
+  }
+});
+
+test('z = -0.5 everywhere never beaches; z = 0 everywhere beaches on the first step', () => {
+  const wet = runEnsemble({ ...WALL_OPTIONS, landMask: bathyWall({ allZ: -0.5 }) });
+  for (const value of wet.beachedAtFrame) assert.equal(value, -1);
+  const dry = runEnsemble({ ...WALL_OPTIONS, landMask: bathyWall({ allZ: 0 }) });
+  const n = WALL_OPTIONS.n;
+  for (let i = 0; i < n; i += 1) {
+    assert.equal(dry.beachedAtFrame[i], 1);
+    // Frozen at the seed-scatter position recorded in frame 0.
+    assert.equal(dry.frames[n * 2 + i * 2], dry.frames[i * 2]);
+    assert.equal(dry.frames[n * 2 + i * 2 + 1], dry.frames[i * 2 + 1]);
+  }
+});
+
+test('coastal bitmask cells never beach and leave the trajectory untouched', () => {
+  const coastal = runEnsemble({ ...WALL_OPTIONS, landMask: uniformMask(MASK_COASTAL) });
+  for (const value of coastal.beachedAtFrame) assert.equal(value, -1);
+  const open = runEnsemble({ ...WALL_OPTIONS, landMask: null });
+  assert.deepEqual(Array.from(coastal.frames), Array.from(open.frames));
+});
+
+test('ensemble with a landMask is deterministic under a fixed seed', () => {
+  const a = runEnsemble({ ...WALL_OPTIONS, landMask: bathyWall() });
+  const b = runEnsemble({ ...WALL_OPTIONS, landMask: bathyWall() });
+  assert.deepEqual(Array.from(a.frames), Array.from(b.frames));
+  assert.deepEqual(Array.from(a.beachedAtFrame), Array.from(b.beachedAtFrame));
 });
 
 test('every frame stays finite even when forcing has NaN holes', () => {

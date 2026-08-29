@@ -32,6 +32,8 @@
  * forcing-field uncertainty dominates integration error at 5–10 min steps.
  */
 
+import { maskStateAt, MASK_LAND } from '../data/landSeaMaskCodec.js';
+
 export const EARTH_RADIUS_M = 6371000;
 
 const DEG = Math.PI / 180;
@@ -177,6 +179,44 @@ export function makeForcingSampler(grid) {
 }
 
 /**
+ * Build a land test from either beaching forcing form. Pure and worker-safe —
+ * no allocation inside the returned closure.
+ *
+ * Forms:
+ * - `{type: 'bathy', lats, lons, z}` — ETOPO-style grid, `z` row-major
+ *   (lat-major) elevation in meters; nearest cell decides, z >= 0 means land
+ *   (the rule from the Catalina drift project). Assumes uniform spacing;
+ *   indices clamp to the grid edges.
+ * - `{type: 'mask', width, height, data}` — packed 2-bit bitmask; land ONLY
+ *   when the cell state is MASK_LAND — coastal-mixed cells never beach.
+ *
+ * @param {Object|null} landMask - Beaching forcing, or null/unknown for none.
+ * @returns {((lat: number, lon: number) => boolean) | null}
+ */
+export function makeLandTester(landMask) {
+  if (!landMask) return null;
+  if (landMask.type === 'bathy') {
+    const { lats, lons, z } = landMask;
+    const nLat = lats.length;
+    const nLon = lons.length;
+    const lat0 = lats[0];
+    const lon0 = lons[0];
+    // Uniform spacing: index by rounding, clamped — no per-call search.
+    const dLat = nLat > 1 ? (lats[nLat - 1] - lat0) / (nLat - 1) : 1;
+    const dLon = nLon > 1 ? (lons[nLon - 1] - lon0) / (nLon - 1) : 1;
+    return (lat, lon) => {
+      const row = Math.min(nLat - 1, Math.max(0, Math.round((lat - lat0) / dLat)));
+      const col = Math.min(nLon - 1, Math.max(0, Math.round((lon - lon0) / dLon)));
+      return z[row * nLon + col] >= 0;
+    };
+  }
+  if (landMask.type === 'mask') {
+    return (lat, lon) => maskStateAt(landMask, lat, lon) === MASK_LAND;
+  }
+  return null;
+}
+
+/**
  * Run a full leeway Monte Carlo ensemble.
  *
  * Per particle, seeded once: an initial position scatter (`posSigmaM`),
@@ -197,8 +237,14 @@ export function makeForcingSampler(grid) {
  * @param {string} [options.cls='PIW'] Leeway class key.
  * @param {Object} [options.classOverrides] Test/tuning overrides merged onto the class.
  * @param {number} [options.posSigmaM=100] Initial position scatter, meters.
- * @returns {{timesMs: Float64Array, frames: Float32Array, n: number, degraded: boolean}}
+ * @param {Object|null} [options.landMask=null] Beaching forcing for
+ *   {@link makeLandTester}; null disables beaching (frames bit-identical to
+ *   the pre-beaching model).
+ * @returns {{timesMs: Float64Array, frames: Float32Array,
+ *   beachedAtFrame: Int32Array, n: number, degraded: boolean}}
  *   `frames` is frame-major `[lon, lat]` pairs: `frames[(t·n + i)·2]` = lon.
+ *   `beachedAtFrame[i]` is the first frame particle i is frozen (−1 = never);
+ *   frames stay dense — a beached particle re-records its last water position.
  */
 export function runEnsemble({
   n,
@@ -212,11 +258,13 @@ export function runEnsemble({
   cls = 'PIW',
   classOverrides = null,
   posSigmaM = 100,
+  landMask = null,
 }) {
   const base = LEEWAY_CLASSES[cls] ?? LEEWAY_CLASSES.PIW;
   const config = classOverrides ? { ...base, ...classOverrides } : base;
   const rng = makeRng(rngSeed);
   const sampler = makeForcingSampler(grid);
+  const isLand = makeLandTester(landMask);
 
   const dtS = dtMin * 60;
   const steps = Math.max(1, Math.round((horizonH * 3600) / dtS));
@@ -240,6 +288,7 @@ export function runEnsemble({
 
   const timesMs = new Float64Array(steps + 1);
   const frames = new Float32Array((steps + 1) * n * 2);
+  const beachedAtFrame = new Int32Array(n).fill(-1);
   let degraded = false;
 
   const record = (frame) => {
@@ -261,6 +310,10 @@ export function runEnsemble({
   for (let step = 1; step <= steps; step += 1) {
     const tMs = startTimeMs + step * dtS * 1000;
     for (let i = 0; i < n; i += 1) {
+      // Beached particles are frozen: no sampling, no rng draws; record()
+      // re-emits the held position so frames stay dense for scrubbing.
+      if (beachedAtFrame[i] !== -1) continue;
+
       const forcing = sampler(lat[i], lon[i], tMs);
       if (forcing.degraded) degraded = true;
 
@@ -277,9 +330,20 @@ export function runEnsemble({
         vN += down * wV + cross * -wU;
       }
 
-      lat[i] += (vN * dtS / EARTH_RADIUS_M) / DEG;
-      const cosLat = Math.cos(lat[i] * DEG);
-      lon[i] += (vE * dtS / (EARTH_RADIUS_M * (cosLat || 1e-9))) / DEG;
+      // Same operation order as the historical in-place update — next lat
+      // first, then cos of the NEW lat for the lon step — so the no-mask
+      // path stays bit-for-bit identical (pinned by the baseline test).
+      const nextLat = lat[i] + (vN * dtS / EARTH_RADIUS_M) / DEG;
+      const cosLat = Math.cos(nextLat * DEG);
+      const nextLon = lon[i] + (vE * dtS / (EARTH_RADIUS_M * (cosLat || 1e-9))) / DEG;
+
+      if (isLand !== null && isLand(nextLat, nextLon)) {
+        // Freeze at the LAST WATER position; no jibe draw on this step.
+        beachedAtFrame[i] = step;
+        continue;
+      }
+      lat[i] = nextLat;
+      lon[i] = nextLon;
 
       if (jibeP > 0 && rng() < jibeP) crossSign[i] = -crossSign[i];
     }
@@ -287,5 +351,5 @@ export function runEnsemble({
     record(step);
   }
 
-  return { timesMs, frames, n, degraded };
+  return { timesMs, frames, beachedAtFrame, n, degraded };
 }
