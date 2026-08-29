@@ -33,7 +33,7 @@ export const DRIFT_DEFAULTS = Object.freeze({
   n: 10000,
   horizonH: 24,
   dtMin: 10,
-  posSigmaM: 150,
+  posSigmaM: 300,
   sigmaTurbMs: 0.05,
 });
 
