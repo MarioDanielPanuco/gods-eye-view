@@ -51,9 +51,15 @@ export function createDriftPanel({
 
   const root = document.createElement('div');
   root.id = 'gev-drift-panel';
+  // Middle-right band — the one strip of chrome-free screen. Bottom-center is
+  // owned by #command-dock/#control-panel/#location-bar/#cockpit-entry, the
+  // bottom-right corner by #gev-voice-control + #view-switcher, the top-right
+  // by #style-indicator + #orbit-indicator, and the left column by the
+  // --left-stack panel slots (built for narrow top-anchored panels, not this
+  // wide transient one). The 36px inset matches the app's right-edge rhythm.
   root.style.cssText = [
-    'position:fixed', 'left:50%', 'bottom:18px', 'transform:translateX(-50%)',
-    'z-index:44', 'min-width:340px', 'max-width:480px',
+    'position:fixed', 'right:36px', 'top:50%', 'transform:translateY(-50%)',
+    'z-index:100', 'min-width:340px', 'max-width:480px',
     'background:rgba(8,14,18,0.92)', 'border:1px solid rgba(255,177,77,0.55)',
     'border-radius:6px', 'padding:10px 12px',
     'font:11px/1.5 "SF Mono", ui-monospace, monospace', 'color:#e8f4ff',
