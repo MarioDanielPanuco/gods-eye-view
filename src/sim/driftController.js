@@ -4,6 +4,7 @@ import { registerSpriteCollection, restoreSpriteOrder } from '../data/spriteOrde
 import { setOverlayEntries, clearOverlaySource } from '../overlays/worldOverlay.js';
 import { metFromDirToUV, oceanToDirToUV } from './leeway.js';
 import { createDriftPanel } from './driftPanel.js';
+import { loadLandSeaMask } from '../data/landSeaMask.js';
 
 /**
  * Drift-simulation controller: fetches the marine forcing grid, runs the
@@ -20,6 +21,7 @@ import { createDriftPanel } from './driftPanel.js';
 
 export const DRIFT_OVERLAY_SOURCE_ID = 'ocean-drift';
 const GRID_URL = '/api/ocean/marine-grid';
+const ETOPO_URL = '/api/ocean/etopo';
 
 /**
  * Ensemble defaults, sized by the frame-buffer formula
@@ -35,6 +37,10 @@ export const DRIFT_DEFAULTS = Object.freeze({
 });
 
 const PARTICLE_COLOR = Cesium.Color.fromCssColorString('#ffb14d');
+const BEACHED_COLOR = Cesium.Color.fromCssColorString('#9fb8c8');
+// Precomputed per-frame point colors — setFrame assigns, never allocates.
+const LIVE_POINT_COLOR = PARTICLE_COLOR.withAlpha(0.55);
+const BEACHED_POINT_COLOR = BEACHED_COLOR.withAlpha(0.55);
 
 /**
  * Normalize a `/api/ocean/marine-grid` payload into the leeway model's
@@ -134,6 +140,7 @@ function runEnsembleInWorker(params) {
  * @param {Function} [options.runEnsembleFn] Injectable ensemble runner (tests).
  * @param {Function} [options.collectionFactory] Injectable point-collection factory (tests).
  * @param {Function} [options.panelFactory] Injectable scrub-panel factory (tests).
+ * @param {Function} [options.maskLoaderFn] Injectable bundled-bitmask loader (tests).
  * @returns {{start: Function, setFrame: Function, play: Function, pause: Function, dispose: Function, isActive: Function}}
  */
 export function createDriftController({
@@ -143,8 +150,9 @@ export function createDriftController({
   runEnsembleFn = runEnsembleInWorker,
   collectionFactory = () => new Cesium.PointPrimitiveCollection({ blendOption: Cesium.BlendOption.TRANSLUCENT }),
   panelFactory = createDriftPanel,
+  maskLoaderFn = loadLandSeaMask,
 } = {}) {
-  let _active = null; // {collection, points, timesMs, frames, n, frameIndex, panel, playTimer}
+  let _active = null; // {collection, points, timesMs, frames, beachedAtFrame, n, frameIndex, panel, playTimer}
 
   function dispose() {
     if (!_active) return;
@@ -161,12 +169,18 @@ export function createDriftController({
     if (!_active) return;
     const clamped = Math.max(0, Math.min(_active.timesMs.length - 1, Math.floor(index)));
     _active.frameIndex = clamped;
-    const { frames, n, points } = _active;
+    const { frames, n, points, beachedAtFrame } = _active;
     const offset = clamped * n * 2;
+    let beachedCount = 0;
     for (let i = 0; i < n; i += 1) {
       points[i].position = Cesium.Cartesian3.fromDegrees(frames[offset + i * 2], frames[offset + i * 2 + 1]);
+      // Frame-derived, so scrubbing back before the beach frame reverts it.
+      const isBeached = beachedAtFrame != null
+        && beachedAtFrame[i] !== -1 && beachedAtFrame[i] <= clamped;
+      if (isBeached) beachedCount += 1;
+      points[i].color = isBeached ? BEACHED_POINT_COLOR : LIVE_POINT_COLOR;
     }
-    _active.panel?.setFrame?.(clamped, _active.timesMs[clamped] - _active.timesMs[0]);
+    _active.panel?.setFrame?.(clamped, _active.timesMs[clamped] - _active.timesMs[0], beachedCount);
     governorRequestRender('drift-scrub');
   }
 
@@ -196,15 +210,33 @@ export function createDriftController({
    */
   async function start({ lat, lon, label = '', n = DRIFT_DEFAULTS.n, horizonH = DRIFT_DEFAULTS.horizonH, dtMin = DRIFT_DEFAULTS.dtMin } = {}) {
     dispose();
-    let grid = null;
-    try {
-      const params = new URLSearchParams({ latitude: lat.toFixed(4), longitude: lon.toFixed(4) });
-      const response = await fetchImpl(`${GRID_URL}?${params}`);
-      if (response.ok) grid = normalizeForcingGrid(await response.json());
-    } catch {
-      grid = null;
-    }
+    const params = new URLSearchParams({ latitude: lat.toFixed(4), longitude: lon.toFixed(4) });
+    // Grid is required; ETOPO bathymetry only upgrades beaching resolution.
+    const [gridSettled, etopoSettled] = await Promise.allSettled([
+      fetchImpl(`${GRID_URL}?${params}`).then((r) => (r.ok ? r.json() : null)),
+      fetchImpl(`${ETOPO_URL}?${params}`).then((r) => (r.ok ? r.json() : null)),
+    ]);
+    const grid = gridSettled.status === 'fulfilled' && gridSettled.value
+      ? normalizeForcingGrid(gridSettled.value)
+      : null;
     if (!grid) return { ok: false, reason: 'marine forcing grid unavailable' };
+
+    // Beaching forcing: ETOPO bathymetry (~3.7 km) → bundled 1/8° bitmask →
+    // null (drift still runs, particles just never beach).
+    let landMask = null;
+    const etopo = etopoSettled.status === 'fulfilled' ? etopoSettled.value : null;
+    if (Array.isArray(etopo?.lats) && etopo.lats.length
+      && Array.isArray(etopo.lons) && etopo.lons.length
+      && Array.isArray(etopo.z) && etopo.z.length === etopo.lats.length * etopo.lons.length) {
+      landMask = { type: 'bathy', lats: etopo.lats, lons: etopo.lons, z: Float32Array.from(etopo.z) };
+    } else {
+      try {
+        const mask = await maskLoaderFn();
+        if (mask) landMask = { type: 'mask', width: mask.width, height: mask.height, data: mask.data };
+      } catch {
+        landMask = null;
+      }
+    }
 
     let result;
     try {
@@ -216,6 +248,7 @@ export function createDriftController({
         horizonH,
         dtMin,
         grid,
+        landMask,
         rngSeed: Date.now() >>> 0,
         posSigmaM: DRIFT_DEFAULTS.posSigmaM,
       });
@@ -233,7 +266,7 @@ export function createDriftController({
           result.frames[startOffset + i * 2 + 1],
         ),
         pixelSize: 2.5,
-        color: PARTICLE_COLOR.withAlpha(0.55),
+        color: LIVE_POINT_COLOR,
         disableDepthTestDistance: Number.POSITIVE_INFINITY,
       }));
     }
@@ -258,6 +291,7 @@ export function createDriftController({
       points,
       timesMs: result.timesMs,
       frames: result.frames,
+      beachedAtFrame: result.beachedAtFrame ?? null,
       n: result.n,
       frameIndex: 0,
       panel,

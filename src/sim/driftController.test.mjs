@@ -77,10 +77,14 @@ function makeSeams() {
   const overlayCalls = [];
   const collection = makeCollection();
   const panel = { frames: [], destroyed: false };
-  return {
+  const seams = {
     overlayCalls,
     collection,
     panel,
+    // Params the injected runEnsembleFn last received (landMask assertions).
+    ensembleParams: null,
+    // Per-test ETOPO response; default 503 so the bitmask fallback engages.
+    etopoResponse: async () => ({ ok: false, status: 503 }),
     options: {
       viewer: {
         scene: {
@@ -96,8 +100,13 @@ function makeSeams() {
         setEntries: (...args) => overlayCalls.push(['entries', ...args]),
         clearSource: (...args) => overlayCalls.push(['clear', ...args]),
       },
-      fetchImpl: async () => ({ ok: true, json: async () => gridPayload() }),
+      fetchImpl: async (url) => {
+        if (String(url).includes('/api/ocean/etopo')) return seams.etopoResponse();
+        return { ok: true, json: async () => gridPayload() };
+      },
+      maskLoaderFn: async () => ({ width: 4, height: 2, data: new Uint8Array([0b01, 0]) }),
       runEnsembleFn: async (params) => {
+        seams.ensembleParams = params;
         // Two frames, params.n particles, all at the seed.
         const n = params.n;
         const frames = new Float32Array(2 * n * 2);
@@ -117,6 +126,7 @@ function makeSeams() {
       }),
     },
   };
+  return seams;
 }
 
 test('start builds the particle cloud, publishes the SIMULATED banner, and setFrame scrubs it', async () => {
@@ -164,6 +174,119 @@ test('a second start disposes the first simulation', async () => {
   await controller.start({ lat: 34.0, lon: -119.0, n: 4 });
   assert.equal(first.destroyed, true);
   assert.equal(second.destroyed, undefined);
+  controller.dispose();
+});
+
+test('start passes a bathy landMask to the ensemble when ETOPO succeeds', async () => {
+  const seams = makeSeams();
+  seams.etopoResponse = async () => ({
+    ok: true,
+    json: async () => ({ status: 'ok', lats: [33, 34], lons: [-119, -118], z: [-10, -5, 0, 3] }),
+  });
+  const controller = createDriftController(seams.options);
+  const result = await controller.start({ lat: 33.5, lon: -118.5, n: 4 });
+  assert.equal(result.ok, true);
+  const mask = seams.ensembleParams.landMask;
+  assert.equal(mask?.type, 'bathy');
+  assert.deepEqual(mask.lats, [33, 34]);
+  assert.deepEqual(mask.lons, [-119, -118]);
+  assert.ok(mask.z instanceof Float32Array, 'z coerced to Float32Array');
+  assert.deepEqual(Array.from(mask.z), [-10, -5, 0, 3]);
+  controller.dispose();
+});
+
+test('start falls back to the bundled bitmask when ETOPO is unavailable', async () => {
+  const seams = makeSeams(); // default etopoResponse is a 503
+  const controller = createDriftController(seams.options);
+  const result = await controller.start({ lat: 33.5, lon: -118.5, n: 4 });
+  assert.equal(result.ok, true);
+  const mask = seams.ensembleParams.landMask;
+  assert.equal(mask?.type, 'mask');
+  assert.equal(mask.width, 4);
+  assert.equal(mask.height, 2);
+  assert.ok(mask.data instanceof Uint8Array);
+  controller.dispose();
+});
+
+test('start still succeeds with a null landMask when ETOPO and the bitmask both fail', async () => {
+  const seams = makeSeams();
+  seams.etopoResponse = async () => { throw new Error('network down'); };
+  seams.options.maskLoaderFn = async () => { throw new Error('asset missing'); };
+  const controller = createDriftController(seams.options);
+  const result = await controller.start({ lat: 33.5, lon: -118.5, n: 4 });
+  assert.equal(result.ok, true);
+  assert.equal(seams.ensembleParams.landMask, null);
+  controller.dispose();
+});
+
+/** Seams whose ensemble beaches particles 1 and 2 at frames 1 and 2 of 3. */
+function beachingSeams() {
+  const seams = makeSeams();
+  seams.options.runEnsembleFn = async (params) => {
+    seams.ensembleParams = params;
+    const n = params.n;
+    const frames = new Float32Array(3 * n * 2);
+    for (let t = 0; t < 3; t += 1) {
+      for (let i = 0; i < n; i += 1) {
+        frames[(t * n + i) * 2] = params.seedLon;
+        frames[(t * n + i) * 2 + 1] = params.seedLat;
+      }
+    }
+    return {
+      timesMs: Float64Array.from([0, 600000, 1200000]),
+      frames,
+      n,
+      degraded: false,
+      beachedAtFrame: Int32Array.from([-1, 1, 2, -1]),
+    };
+  };
+  return seams;
+}
+
+test('setFrame recolors beached particles per-frame and reverts on back-scrub', async () => {
+  const seams = beachingSeams();
+  const controller = createDriftController(seams.options);
+  await controller.start({ lat: 33.5, lon: -118.5, n: 4 });
+  const points = seams.collection.points;
+  const live = points[0].color;
+
+  // Frame 0: nothing beached yet.
+  assert.deepEqual(points[1].color, live);
+  assert.deepEqual(points[2].color, live);
+
+  controller.setFrame(1); // particle 1 beaches at frame 1
+  assert.notDeepEqual(points[1].color, live);
+  assert.deepEqual(points[2].color, live);
+
+  controller.setFrame(2); // particle 2 beaches at frame 2
+  assert.notDeepEqual(points[2].color, live);
+  assert.deepEqual(points[1].color, points[2].color);
+  assert.deepEqual(points[0].color, live);
+  assert.deepEqual(points[3].color, live);
+
+  controller.setFrame(0); // back-scrub restores the live color
+  assert.deepEqual(points[1].color, live);
+  assert.deepEqual(points[2].color, live);
+  controller.dispose();
+});
+
+test('setFrame reports the beached count to the panel, frame-derived', async () => {
+  const seams = beachingSeams();
+  const calls = [];
+  seams.options.panelFactory = () => ({
+    setFrame: (i, offsetMs, beachedCount) => calls.push([i, beachedCount]),
+    setPlaying: () => {},
+    destroy: () => {},
+  });
+  const controller = createDriftController(seams.options);
+  await controller.start({ lat: 33.5, lon: -118.5, n: 4 });
+  assert.deepEqual(calls.at(-1), [0, 0]);
+  controller.setFrame(1);
+  assert.deepEqual(calls.at(-1), [1, 1]);
+  controller.setFrame(2);
+  assert.deepEqual(calls.at(-1), [2, 2]);
+  controller.setFrame(0);
+  assert.deepEqual(calls.at(-1), [0, 0]);
   controller.dispose();
 });
 

@@ -15,7 +15,8 @@
  * @param {(index: number) => void} options.onScrub
  * @param {() => void} options.onPlayPause
  * @param {() => void} options.onClose
- * @returns {{setFrame: Function, setPlaying: Function, destroy: Function}}
+ * @returns {{setFrame: (index: number, offsetMs?: number, beachedCount?: number) => void,
+ *   setPlaying: Function, destroy: Function}}
  */
 export function createDriftPanel({
   particleCount,
@@ -51,6 +52,10 @@ export function createDriftPanel({
   meta.textContent = `${classLabel} · ${Number(particleCount).toLocaleString()} particles · ${horizonH} h forecast drift`
     + (degraded ? ' · ⚠ forcing gaps' : '');
   meta.style.cssText = 'color:#9fb8c8;margin-bottom:8px;';
+  const beached = document.createElement('span');
+  beached.hidden = true; // shown only while the current frame has beached particles
+  beached.style.cssText = 'color:#ffb14d;margin-left:8px;';
+  meta.appendChild(beached);
   root.appendChild(meta);
 
   const row = document.createElement('div');
@@ -92,12 +97,16 @@ export function createDriftPanel({
   document.body.appendChild(root);
 
   return {
-    setFrame(index, offsetMs) {
+    setFrame(index, offsetMs, beachedCount = 0) {
       slider.value = String(index);
       const totalMinutes = Math.max(0, Math.round((offsetMs ?? 0) / 60000));
       const hh = String(Math.floor(totalMinutes / 60)).padStart(2, '0');
       const mm = String(totalMinutes % 60).padStart(2, '0');
       clock.textContent = `T+${hh}:${mm}`;
+      beached.hidden = !(beachedCount > 0);
+      beached.textContent = beachedCount > 0
+        ? `⚓ ${Number(beachedCount).toLocaleString()} beached`
+        : '';
     },
     setPlaying(playing) {
       playButton.textContent = playing ? '⏸' : '▶';
