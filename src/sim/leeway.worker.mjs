@@ -18,6 +18,9 @@ self.onmessage = (event) => {
       beachedAtFrame: result.beachedAtFrame,
       n: result.n,
       degraded: result.degraded,
+      meanEndLat: result.meanEndLat,
+      meanEndLon: result.meanEndLon,
+      spreadKm: result.spreadKm,
     }, [result.timesMs.buffer, result.frames.buffer, result.beachedAtFrame.buffer]);
   } catch (error) {
     self.postMessage({ type: 'error', message: String(error?.message ?? error) });

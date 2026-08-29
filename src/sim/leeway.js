@@ -27,9 +27,13 @@
  * - OpenDrift Leeway model (met.no), OBJECTPROP.DAT + leeway.py — the
  *   machine-readable taxonomy and the per-step jibe formula mirrored here.
  *
- * Time integration is forward Euler over forecast fields interpolated
- * bilinearly in space and linearly in time — appropriate here because
- * forcing-field uncertainty dominates integration error at 5–10 min steps.
+ * Time integration is classical RK4 on dx/dt = v(x, t) over forecast fields
+ * interpolated bilinearly in space and linearly in time. The per-particle
+ * leeway perturbation, crosswind sign, and turbulence draw are held constant
+ * across the four stages of a step (the stochastic terms are step-piecewise
+ * constant, so RK4's order applies to the deterministic forcing part).
+ * Particle 0 carries no stochastic terms at all: it is the deterministic
+ * best-estimate track.
  */
 
 import { maskStateAt, MASK_LAND } from '../data/landSeaMaskCodec.js';
@@ -217,13 +221,36 @@ export function makeLandTester(landMask) {
 }
 
 /**
+ * Great-circle distance (haversine, R = 6371 km) between two lat/lon points.
+ * @param {number} lat1 @param {number} lon1 @param {number} lat2
+ * @param {number} lon2
+ * @returns {number} Distance in kilometers.
+ */
+function haversineKm(lat1, lon1, lat2, lon2) {
+  const dLat = (lat2 - lat1) * DEG;
+  const dLon = (lon2 - lon1) * DEG;
+  const a = Math.sin(dLat / 2) ** 2
+    + Math.cos(lat1 * DEG) * Math.cos(lat2 * DEG) * Math.sin(dLon / 2) ** 2;
+  return 2 * 6371 * Math.asin(Math.sqrt(Math.min(1, a)));
+}
+
+/**
  * Run a full leeway Monte Carlo ensemble.
  *
  * Per particle, seeded once: an initial position scatter (`posSigmaM`),
  * additive downwind/crosswind velocity residuals ~N(0, stdCms/100), and a
  * 50/50 crosswind sign that may jibe each step. Per step: velocity =
  * current + downwind leeway along the wind unit vector + signed crosswind
- * leeway along its right-perpendicular, advanced on the sphere.
+ * leeway along its right-perpendicular (+ optional per-step turbulence),
+ * advanced on the sphere with classical RK4.
+ *
+ * Particle 0 is the deterministic best-estimate track: no initial scatter,
+ * zero leeway residuals, no jibe, no turbulence, and no crosswind term at
+ * all — the ±1 crosswind sign makes that term bimodal with mean ≈ 0, so the
+ * best estimate excludes it rather than picking a sign. Its random numbers
+ * are still drawn (and discarded) exactly like any other particle's, so
+ * particles 1..n−1 see bit-identical rng streams regardless of how the
+ * control particle is treated.
  *
  * @param {Object} options
  * @param {number} options.n Particle count.
@@ -237,14 +264,25 @@ export function makeLandTester(landMask) {
  * @param {string} [options.cls='PIW'] Leeway class key.
  * @param {Object} [options.classOverrides] Test/tuning overrides merged onto the class.
  * @param {number} [options.posSigmaM=100] Initial position scatter, meters.
+ * @param {number} [options.sigmaTurbMs=0] Per-step turbulent velocity noise,
+ *   m/s: each perturbed particle adds (du, dv) ~ N(0, σ) drawn once per step
+ *   and held across the four RK4 stages. 0 leaves the rng stream untouched.
+ * @param {boolean} [options.backward=false] Integrate backward in time:
+ *   timesMs decrease from startTimeMs (frames stay in integration order).
+ *   Beaching applies identically — a reverse-drifting particle freezing on
+ *   land answers "could they have come from shore".
  * @param {Object|null} [options.landMask=null] Beaching forcing for
  *   {@link makeLandTester}; null disables beaching (frames bit-identical to
  *   the pre-beaching model).
  * @returns {{timesMs: Float64Array, frames: Float32Array,
- *   beachedAtFrame: Int32Array, n: number, degraded: boolean}}
+ *   beachedAtFrame: Int32Array, n: number, degraded: boolean,
+ *   meanEndLat: number, meanEndLon: number, spreadKm: number}}
  *   `frames` is frame-major `[lon, lat]` pairs: `frames[(t·n + i)·2]` = lon.
  *   `beachedAtFrame[i]` is the first frame particle i is frozen (−1 = never);
  *   frames stay dense — a beached particle re-records its last water position.
+ *   `meanEndLat`/`meanEndLon` average the final-frame positions of ALL
+ *   particles (beached ones at their frozen position); `spreadKm` is the RMS
+ *   great-circle distance of those positions from that mean.
  */
 export function runEnsemble({
   n,
@@ -258,6 +296,8 @@ export function runEnsemble({
   cls = 'PIW',
   classOverrides = null,
   posSigmaM = 100,
+  sigmaTurbMs = 0,
+  backward = false,
   landMask = null,
 }) {
   const base = LEEWAY_CLASSES[cls] ?? LEEWAY_CLASSES.PIW;
@@ -267,6 +307,7 @@ export function runEnsemble({
   const isLand = makeLandTester(landMask);
 
   const dtS = dtMin * 60;
+  const dtSigned = backward ? -dtS : dtS;
   const steps = Math.max(1, Math.round((horizonH * 3600) / dtS));
   const jibeP = perStepJibeProbability(config.jibeRatePerHour, dtS);
 
@@ -284,6 +325,16 @@ export function runEnsemble({
     downEps[i] = randn(rng) * (config.downwind.stdCms / 100);
     crossEps[i] = randn(rng) * (config.crosswind.stdCms / 100);
     crossSign[i] = rng() < 0.5 ? -1 : 1;
+  }
+  // Particle 0 is the deterministic control track: its draws above were
+  // consumed (keeping particles 1..n−1 on bit-identical streams) but are
+  // discarded here. crossSign[0] is never read — the control particle has
+  // no crosswind term (the ±1 sign bimodality has mean ≈ 0).
+  if (n > 0) {
+    lat[0] = seedLat;
+    lon[0] = seedLon;
+    downEps[0] = 0;
+    crossEps[0] = 0;
   }
 
   const timesMs = new Float64Array(steps + 1);
@@ -307,35 +358,73 @@ export function runEnsemble({
   const crossSlope = config.crosswind.slopePct / 100;
   const crossOffset = config.crosswind.offsetCms / 100;
 
-  for (let step = 1; step <= steps; step += 1) {
-    const tMs = startTimeMs + step * dtS * 1000;
-    for (let i = 0; i < n; i += 1) {
-      // Beached particles are frozen: no sampling, no rng draws; record()
-      // re-emits the held position so frames stay dense for scrubbing.
-      if (beachedAtFrame[i] !== -1) continue;
+  // One RK4 stage: sample the forcing at (pLat, pLon, tMs), add the leeway
+  // response and the step-held turbulence (du, dv), and return the position
+  // rate in deg/s using THIS stage's latitude for the metric factor.
+  const stageRate = (i, pLat, pLon, tMs, du, dv) => {
+    const forcing = sampler(pLat, pLon, tMs);
+    if (forcing.degraded) degraded = true;
 
-      const forcing = sampler(lat[i], lon[i], tMs);
-      if (forcing.degraded) degraded = true;
-
-      let vE = forcing.curU;
-      let vN = forcing.curV;
-      const windSpeed = Math.hypot(forcing.windU, forcing.windV);
-      if (windSpeed > 0) {
-        const wU = forcing.windU / windSpeed;
-        const wV = forcing.windV / windSpeed;
+    let vE = forcing.curU + du;
+    let vN = forcing.curV + dv;
+    const windSpeed = Math.hypot(forcing.windU, forcing.windV);
+    if (windSpeed > 0) {
+      const wU = forcing.windU / windSpeed;
+      const wV = forcing.windV / windSpeed;
+      if (i === 0) {
+        // Control particle: pure current + mean downwind response only.
+        const down = downSlope * windSpeed + downOffset;
+        vE += down * wU;
+        vN += down * wV;
+      } else {
         const down = downSlope * windSpeed + downOffset + downEps[i];
         const cross = crossSign[i] * (crossSlope * windSpeed + crossOffset + crossEps[i]);
         // Right-perpendicular of the downwind unit vector: (v, −u).
         vE += down * wU + cross * wV;
         vN += down * wV + cross * -wU;
       }
+    }
 
-      // Same operation order as the historical in-place update — next lat
-      // first, then cos of the NEW lat for the lon step — so the no-mask
-      // path stays bit-for-bit identical (pinned by the baseline test).
-      const nextLat = lat[i] + (vN * dtS / EARTH_RADIUS_M) / DEG;
-      const cosLat = Math.cos(nextLat * DEG);
-      const nextLon = lon[i] + (vE * dtS / (EARTH_RADIUS_M * (cosLat || 1e-9))) / DEG;
+    const cosLat = Math.cos(pLat * DEG);
+    return {
+      dLat: (vN / EARTH_RADIUS_M) / DEG,
+      dLon: (vE / (EARTH_RADIUS_M * (cosLat || 1e-9))) / DEG,
+    };
+  };
+
+  for (let step = 1; step <= steps; step += 1) {
+    // Stage times for this step: t0 = start of step, in signed time.
+    const t0 = startTimeMs + (step - 1) * dtSigned * 1000;
+    const tHalf = t0 + dtSigned * 500;
+    const t1 = t0 + dtSigned * 1000;
+    for (let i = 0; i < n; i += 1) {
+      // Beached particles are frozen: no sampling, no rng draws; record()
+      // re-emits the held position so frames stay dense for scrubbing.
+      if (beachedAtFrame[i] !== -1) continue;
+
+      // Turbulence: one (du, dv) draw per step, held across all four stages.
+      // The draws are consumed for the control particle too (and discarded)
+      // so particles 1..n−1 keep bit-identical streams.
+      let du = 0;
+      let dv = 0;
+      if (sigmaTurbMs > 0) {
+        const gu = randn(rng);
+        const gv = randn(rng);
+        if (i !== 0) {
+          du = gu * sigmaTurbMs;
+          dv = gv * sigmaTurbMs;
+        }
+      }
+
+      // Classical RK4 on dx/dt = v(x, t). The stochastic terms (leeway
+      // residuals, crosswind sign, turbulence) are constant across the four
+      // stages, so RK4's order applies to the deterministic forcing part.
+      const k1 = stageRate(i, lat[i], lon[i], t0, du, dv);
+      const k2 = stageRate(i, lat[i] + k1.dLat * dtSigned / 2, lon[i] + k1.dLon * dtSigned / 2, tHalf, du, dv);
+      const k3 = stageRate(i, lat[i] + k2.dLat * dtSigned / 2, lon[i] + k2.dLon * dtSigned / 2, tHalf, du, dv);
+      const k4 = stageRate(i, lat[i] + k3.dLat * dtSigned, lon[i] + k3.dLon * dtSigned, t1, du, dv);
+      const nextLat = lat[i] + (dtSigned / 6) * (k1.dLat + 2 * k2.dLat + 2 * k3.dLat + k4.dLat);
+      const nextLon = lon[i] + (dtSigned / 6) * (k1.dLon + 2 * k2.dLon + 2 * k3.dLon + k4.dLon);
 
       if (isLand !== null && isLand(nextLat, nextLon)) {
         // Freeze at the LAST WATER position; no jibe draw on this step.
@@ -345,11 +434,29 @@ export function runEnsemble({
       lat[i] = nextLat;
       lon[i] = nextLon;
 
+      // Jibe draw AFTER the position update, once per step. Consumed for the
+      // control particle too, but crossSign[0] is never read.
       if (jibeP > 0 && rng() < jibeP) crossSign[i] = -crossSign[i];
     }
-    timesMs[step] = tMs;
+    timesMs[step] = t1;
     record(step);
   }
 
-  return { timesMs, frames, beachedAtFrame, n, degraded };
+  // Ensemble diagnostics over ALL particles (beached ones sit frozen at
+  // their last water position in lat/lon, so they are included as-is).
+  let sumLat = 0;
+  let sumLon = 0;
+  for (let i = 0; i < n; i += 1) {
+    sumLat += lat[i];
+    sumLon += lon[i];
+  }
+  const meanEndLat = n > 0 ? sumLat / n : seedLat;
+  const meanEndLon = n > 0 ? sumLon / n : seedLon;
+  let sumSqKm = 0;
+  for (let i = 0; i < n; i += 1) {
+    sumSqKm += haversineKm(meanEndLat, meanEndLon, lat[i], lon[i]) ** 2;
+  }
+  const spreadKm = n > 0 ? Math.sqrt(sumSqKm / n) : 0;
+
+  return { timesMs, frames, beachedAtFrame, n, degraded, meanEndLat, meanEndLon, spreadKm };
 }
