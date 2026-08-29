@@ -1,12 +1,19 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import {
   normalizeOceanObs,
   buildMarineGridAxes,
   marineHoursToMs,
   normalizeMarineGridUpstream,
   fetchOceanObs,
+  buildEtopoBox,
+  normalizeEtopoUpstream,
 } from '../../vite.config.js';
+
+const ETOPO_FIXTURE = JSON.parse(
+  readFileSync(new URL('./fixtures/etopo-sample.json', import.meta.url), 'utf8'),
+);
 
 const OBS_TEXT =
   '#STN       LAT      LON  YYYY MM DD hh mm WDIR WSPD   GST WVHT  DPD APD MWD   PRES  PTDY  ATMP  WTMP  DEWP  VIS   TIDE\n' +
@@ -111,4 +118,65 @@ test('fetchOceanObs rejects HTML upstream bodies (broken feed, never cache them)
     fetchOceanObs({ fetchImpl: async () => new Response('<html>503</html>', { status: 200 }) }),
     /non-NDBC/,
   );
+});
+
+test('buildEtopoBox centers a ±1.5 deg box on the seed', () => {
+  const box = buildEtopoBox(36.5, -122.5);
+  assert.deepEqual(box, { lat0: 35, lat1: 38, lon0: -124, lon1: -121 });
+});
+
+test('buildEtopoBox clamps to valid latitude/longitude ranges near the edges', () => {
+  const box = buildEtopoBox(89.2, 179.2);
+  assert.equal(box.lat1, 90);
+  assert.equal(box.lon1, 180);
+  assert.equal(box.lat0, 87.7);
+  assert.equal(box.lon0, 177.7);
+  const south = buildEtopoBox(-89.4, -179.4);
+  assert.equal(south.lat0, -90);
+  assert.equal(south.lon0, -180);
+});
+
+test('buildEtopoBox rounds edges to 4 decimals so cache keys stay stable', () => {
+  const box = buildEtopoBox(36.123456789, -122.987654321);
+  assert.deepEqual(box, { lat0: 34.6235, lat1: 37.6235, lon0: -124.4877, lon1: -121.4877 });
+});
+
+test('normalizeEtopoUpstream parses the captured ERDDAP table fixture with exact spot values', () => {
+  const grid = normalizeEtopoUpstream(ETOPO_FIXTURE);
+  assert.deepEqual(grid.lats, [36, 36.03333333333333, 36.06666666666666, 36.099999999999994]);
+  assert.deepEqual(grid.lons, [-122.1, -122.06666666666666, -122.03333333333333, -122]);
+  assert.equal(grid.z.length, 16);
+  // Row-major: z[latIndex * lons.length + lonIndex], both axes ascending.
+  assert.equal(grid.z[0], -1442); // (36, -122.1)
+  assert.equal(grid.z[3], -1265); // (36, -122)
+  assert.equal(grid.z[8], -1672); // (36.0667, -122.1)
+  assert.equal(grid.z[15], -1344); // (36.1, -122)
+});
+
+test('normalizeEtopoUpstream keys by column NAME — shuffled columns still parse', () => {
+  const shuffled = {
+    table: {
+      columnNames: ['altitude', 'longitude', 'latitude'],
+      rows: ETOPO_FIXTURE.table.rows.map(([lat, lon, alt]) => [alt, lon, lat]),
+    },
+  };
+  assert.deepEqual(normalizeEtopoUpstream(shuffled), normalizeEtopoUpstream(ETOPO_FIXTURE));
+});
+
+test('normalizeEtopoUpstream returns null on shape drift, never empty bathymetry', () => {
+  assert.equal(normalizeEtopoUpstream(null), null);
+  assert.equal(normalizeEtopoUpstream({}), null);
+  assert.equal(normalizeEtopoUpstream({ table: { columnNames: ['latitude', 'longitude', 'altitude'], rows: [] } }), null);
+  // Renamed column.
+  assert.equal(normalizeEtopoUpstream({
+    table: { columnNames: ['latitude', 'longitude', 'elevation'], rows: ETOPO_FIXTURE.table.rows },
+  }), null);
+  // Non-numeric altitude entry.
+  const badValue = structuredClone(ETOPO_FIXTURE);
+  badValue.table.rows[5][2] = null;
+  assert.equal(normalizeEtopoUpstream(badValue), null);
+  // Dropped row — lats×lons no longer covers the table.
+  const truncated = structuredClone(ETOPO_FIXTURE);
+  truncated.table.rows.pop();
+  assert.equal(normalizeEtopoUpstream(truncated), null);
 });

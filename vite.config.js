@@ -7287,6 +7287,10 @@ const OCEAN_GRID_CACHE_MS = 30 * 60_000;
 const OCEAN_GRID_STALE_MS = 120 * 60_000;
 const OCEAN_GRID_MAX_CACHE = 24;
 const OCEAN_MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
+const OCEAN_ETOPO_CACHE_MS = 7 * 24 * 3600_000;
+// Bathymetry is static — a stale cache entry is never wrong, serve it forever.
+const OCEAN_ETOPO_STALE_MS = Number.POSITIVE_INFINITY;
+const OCEAN_ETOPO_MAX_CACHE = 24;
 let _oceanObsCache = null;
 let _oceanStationsCache = null;
 const _oceanObsInFlight = new Map();
@@ -7294,9 +7298,12 @@ const _oceanMarineCache = new Map();
 const _oceanMarineInFlight = new Map();
 const _oceanGridCache = new Map();
 const _oceanGridInFlight = new Map();
+const _oceanEtopoCache = new Map();
+const _oceanEtopoInFlight = new Map();
 const _oceanObsRateLimiter = makeRateLimiter({ windowMs: 60_000, max: 30, globalMax: 90 });
 const _oceanMarineRateLimiter = makeRateLimiter({ windowMs: 60_000, max: 45, globalMax: 120 });
 const _oceanGridRateLimiter = makeRateLimiter({ windowMs: 60_000, max: 6, globalMax: 18 });
+const _oceanEtopoRateLimiter = makeRateLimiter({ windowMs: 60_000, max: 6, globalMax: 18 });
 
 /**
  * Join station names/types from activestations.xml metadata onto parsed
@@ -7324,6 +7331,60 @@ export function buildMarineGridAxes(latitude, longitude) {
     return values;
   };
   return { lats: axis(latitude, -90, 90), lons: axis(longitude, -180, 180) };
+}
+
+/**
+ * Bathymetry request box centered on the drift seed: forcing box ±1.0° plus
+ * 0.5° drift margin = ±1.5°. Edges are range-clamped (near-pole/dateline
+ * seeds degrade to a truncated box) and rounded to 4 decimals so upstream
+ * URLs and cache keys stay stable.
+ */
+export function buildEtopoBox(latitude, longitude) {
+  const edge = (value, min, max) => Number(Math.min(max, Math.max(min, value)).toFixed(4));
+  return {
+    lat0: edge(latitude - 1.5, -90, 90),
+    lat1: edge(latitude + 1.5, -90, 90),
+    lon0: edge(longitude - 1.5, -180, 180),
+    lon1: edge(longitude + 1.5, -180, 180),
+  };
+}
+
+/**
+ * Normalize an ERDDAP griddap table-JSON response into `{lats, lons, z}` with
+ * `z` row-major over ascending axes: `z[latIndex * lons.length + lonIndex]`.
+ * Columns are looked up by NAME so row-order or column-order drift upstream
+ * still parses. Returns null on any shape drift — missing table/column,
+ * non-finite value, or rows not covering the full lats×lons grid — so
+ * callers treat drift as an upstream failure, never as empty bathymetry.
+ */
+export function normalizeEtopoUpstream(json) {
+  const names = json?.table?.columnNames;
+  const rows = json?.table?.rows;
+  if (!Array.isArray(names) || !Array.isArray(rows) || rows.length === 0) return null;
+  const latCol = names.indexOf('latitude');
+  const lonCol = names.indexOf('longitude');
+  const altCol = names.indexOf('altitude');
+  if (latCol === -1 || lonCol === -1 || altCol === -1) return null;
+  const latSet = new Set();
+  const lonSet = new Set();
+  for (const row of rows) {
+    if (!Array.isArray(row)) return null;
+    if (!Number.isFinite(row[latCol]) || !Number.isFinite(row[lonCol]) || !Number.isFinite(row[altCol])) return null;
+    latSet.add(row[latCol]);
+    lonSet.add(row[lonCol]);
+  }
+  const lats = [...latSet].sort((a, b) => a - b);
+  const lons = [...lonSet].sort((a, b) => a - b);
+  if (lats.length * lons.length !== rows.length) return null;
+  const latIndex = new Map(lats.map((value, i) => [value, i]));
+  const lonIndex = new Map(lons.map((value, i) => [value, i]));
+  const z = new Array(rows.length).fill(null);
+  for (const row of rows) {
+    z[latIndex.get(row[latCol]) * lons.length + lonIndex.get(row[lonCol])] = row[altCol];
+  }
+  // Duplicate rows leave unfilled cells — that's drift too.
+  if (z.includes(null)) return null;
+  return { lats, lons, z };
 }
 
 /**
@@ -7520,6 +7581,32 @@ function oceanProxy() {
     return payload;
   }
 
+  async function refreshEtopo(point, key) {
+    const box = buildEtopoBox(point.latitude, point.longitude);
+    // Stride 2 = 2 arc-min (~3.7 km): 91×91 nodes ≈ 150–250 KB JSON vs ~2 MB
+    // at stride 1, and 3.7 km is far finer than the 0.5° forcing grid.
+    const query = `altitude[(${box.lat0}):2:(${box.lat1})][(${box.lon0}):2:(${box.lon1})]`
+      .replace(/\[/g, '%5B')
+      .replace(/\]/g, '%5D');
+    const upstream = await fetchRegionalJson(
+      `https://coastwatch.pfeg.noaa.gov/erddap/griddap/etopo180.json?${query}`,
+      { maxBytes: OCEAN_MAX_RESPONSE_BYTES, timeoutMs: 20_000 },
+    );
+    const grid = normalizeEtopoUpstream(upstream);
+    if (!grid) throw new Error('ETOPO response shape mismatch');
+    const payload = {
+      status: 'ready',
+      retrievedAt: new Date().toISOString(),
+      seed: point,
+      lats: grid.lats,
+      lons: grid.lons,
+      z: grid.z,
+    };
+    _oceanEtopoCache.set(key, { payload, cachedAt: Date.now() });
+    trimOceanCache(_oceanEtopoCache, OCEAN_ETOPO_MAX_CACHE);
+    return payload;
+  }
+
   function install(middlewares) {
     middlewares.use('/api/ocean', async (req, res) => {
       const sendJson = (status, headers, body) => {
@@ -7600,6 +7687,41 @@ function oceanProxy() {
               return;
             }
             sendJson(503, { 'Cache-Control': 'no-store' }, { error: 'Marine forecast is temporarily unavailable' });
+          }
+          return;
+        }
+
+        if (subPath === '/etopo') {
+          if (!_oceanEtopoRateLimiter(clientKey(req))) {
+            sendJson(429, { 'Retry-After': '10' }, { error: 'Rate limit exceeded' });
+            return;
+          }
+          const url = new URL(req.url || '', 'http://localhost');
+          const point = validRegionalPoint(url.searchParams);
+          if (!point) {
+            sendJson(400, {}, { error: 'Valid latitude and longitude are required' });
+            return;
+          }
+          // 0.25° cells like the forcing grid — nearby drift seeds share bathymetry.
+          const key = `${(Math.round(point.latitude * 4) / 4).toFixed(2)},${(Math.round(point.longitude * 4) / 4).toFixed(2)}`;
+          const now = Date.now();
+          const cached = _oceanEtopoCache.get(key);
+          if (cached && now - cached.cachedAt <= OCEAN_ETOPO_CACHE_MS) {
+            sendJson(200, { 'Cache-Control': 'public, max-age=86400', 'X-Ocean-Etopo': 'HIT' },
+              { ...cached.payload, status: 'cached' });
+            return;
+          }
+          const request = coalesceProxyRequest(_oceanEtopoInFlight, key, () => refreshEtopo(point, key));
+          try {
+            const payload = await request.promise;
+            sendJson(200, { 'Cache-Control': 'public, max-age=86400', 'X-Ocean-Etopo': request.shared ? 'INFLIGHT' : 'MISS' }, payload);
+          } catch {
+            if (cached && now - cached.cachedAt <= OCEAN_ETOPO_STALE_MS) {
+              sendJson(200, { 'Cache-Control': 'no-store', 'X-Ocean-Etopo': 'STALE' },
+                { ...cached.payload, status: 'stale' });
+              return;
+            }
+            sendJson(503, { 'Cache-Control': 'no-store' }, { error: 'Bathymetry is temporarily unavailable' });
           }
           return;
         }
@@ -7727,6 +7849,8 @@ export default defineConfig(({ mode }) => {
       'import.meta.env.GOOGLE_MAPS_API_KEY': JSON.stringify(env.GOOGLE_MAPS_API_KEY),
       'import.meta.env.CESIUM_ION_TOKEN': JSON.stringify(env.CESIUM_ION_TOKEN),
     },
+    // The bundled land/sea mask ships as a raw .bin asset (url import).
+    assetsInclude: ['**/*.bin'],
     build: {
       // The Cesium engine bundle is inherently large; raise the warning ceiling
       // so the build log isn't dominated by an expected chunk-size notice.
