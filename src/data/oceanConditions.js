@@ -7,6 +7,8 @@ import {
 import { hitTestWorldOverlay } from '../overlays/worldOverlay.js';
 import { governorRequestRender } from '../renderGovernor.js';
 import { createDriftController } from '../sim/driftController.js';
+import { loadLandSeaMask } from './landSeaMask.js';
+import { maskStateAt, MASK_LAND, MASK_WATER } from './landSeaMaskCodec.js';
 import { registerPickOwner, unregisterPickOwner, isOwnedByOtherLayer, resolvePickId } from './pickRegistry.js';
 
 /**
@@ -18,7 +20,9 @@ import { registerPickOwner, unregisterPickOwner, isOwnedByOtherLayer, resolvePic
  * card of the station's OBSERVED values and appends Open-Meteo Marine
  * FORECAST lines when `/api/ocean/marine` resolves — observations and
  * forecasts are labeled distinctly and missing fields are omitted, never
- * rendered as placeholders.
+ * rendered as placeholders. Point clicks are gated by the bundled land/sea
+ * mask: land cells select nothing, water cells get their DRIFT chip before
+ * the forecast probe, coastal cells keep the probe-then-chip fallback.
  *
  * Geometry values are STATIC (plain numbers redefined per poll) — a
  * CallbackProperty here would re-tessellate per frame for data that changes
@@ -273,6 +277,7 @@ function forecastHoursToMs(times) {
 export function createOceanConditionsLayer({
   overlayHost = DEFAULT_OVERLAY_HOST,
   driftControllerFactory = (options) => createDriftController(options),
+  maskLoader = loadLandSeaMask,
 } = {}) {
   let _viewer = null;
   let _dataSource = null;
@@ -285,6 +290,7 @@ export function createOceanConditionsLayer({
   let _highlightEntity = null;
   let _selectionToken = 0;
   let _driftController = null;
+  let _mask = null;
 
   function ensureDriftController() {
     if (!_driftController) {
@@ -432,12 +438,22 @@ export function createOceanConditionsLayer({
 
   /** Open-water click: a coordinate card that fills in with forecast lines. */
   async function selectOceanPoint(latitude, longitude, position) {
+    // Land/sea mask gate. A land cell produces nothing at all — the click
+    // handler's empty-space branch already cleared any active selection, so
+    // this returns BEFORE clearSelection to leave every overlay source
+    // untouched. Coastal cells and an unloaded mask keep the probe fallback.
+    const maskState = _mask ? maskStateAt(_mask, latitude, longitude) : null;
+    if (maskState === MASK_LAND) return;
+    const maskSaysWater = maskState === MASK_WATER;
     clearSelection();
     const token = _selectionToken;
     const key = `ocean-point:${latitude.toFixed(3)},${longitude.toFixed(3)}`;
     const title = `${Math.abs(latitude).toFixed(2)}°${latitude >= 0 ? 'N' : 'S'} ${Math.abs(longitude).toFixed(2)}°${longitude >= 0 ? 'E' : 'W'}`;
     const baseLines = [title];
     publishSelectionCard(key, position, [...baseLines, '⏳ fetching marine forecast…']);
+    // A mask-confirmed water cell is the drift authority — the chip goes up
+    // before (and independent of) the forecast probe.
+    if (maskSaysWater) publishDriftChip(key, position, latitude, longitude);
     if (token !== _selectionToken) return;
 
     try {
@@ -452,10 +468,13 @@ export function createOceanConditionsLayer({
       const forecastLines = payload ? formatMarineForecastLines(payload, Date.now()) : [];
       if (forecastLines.length) {
         publishSelectionCard(key, position, [...baseLines, ...forecastLines]);
-        // Marine data resolved → this point is water: offer the drift action.
-        publishDriftChip(key, position, latitude, longitude);
+        // Marine data resolved → this point is water: offer the drift action
+        // (mask-confirmed water already has it).
+        if (!maskSaysWater) publishDriftChip(key, position, latitude, longitude);
       } else {
-        // The MVP land/sea mask: no marine forecast means no drift either.
+        // Probe fallback: no marine forecast means no drift. Mask-confirmed
+        // water keeps its chip — only the card gains the NO MARINE DATA line;
+        // the action source is never cleared here.
         publishSelectionCard(key, position, [...baseLines, 'NO MARINE DATA']);
       }
     } catch {
@@ -543,6 +562,9 @@ export function createOceanConditionsLayer({
         typeof pickedId === 'string' && pickedId.startsWith(ENTITY_ID_PREFIX)
       ));
       installClickHandler(viewer);
+      // Kick the (memoized, retryable) mask load; click gating rides the
+      // probe fallback until it lands, and a rejection is non-fatal.
+      maskLoader().then((mask) => { _mask = mask; }).catch(() => {});
       governorRequestRender('ocean-visibility');
     },
 
@@ -644,6 +666,7 @@ export function createOceanConditionsLayer({
         _dataSource = null;
       }
       _viewer = null;
+      _mask = null;
       _count = 0;
       _lastUpdate = null;
       _lastError = null;

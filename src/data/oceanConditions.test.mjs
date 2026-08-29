@@ -22,6 +22,13 @@ import {
   OCEAN_ACTION_OVERLAY_SOURCE_ID,
   OCEAN_OVERLAY_COHORT_LIMIT,
 } from './oceanConditions.js';
+import {
+  buildMaskFileBuffer,
+  decodeMaskBuffer,
+  MASK_WATER,
+  MASK_LAND,
+  MASK_COASTAL,
+} from './landSeaMaskCodec.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -435,6 +442,183 @@ test('disable disposes an active drift simulation and clears the chip source', a
     assert.ok(overlayHost.calls.some(
       ([kind, sourceId]) => kind === 'clear' && sourceId === OCEAN_ACTION_OVERLAY_SOURCE_ID,
     ));
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+});
+
+/**
+ * 4x4 synthetic mask: 90° lon x 45° lat cells, row-major from (-90, -180).
+ * All water except one land cell containing (10, 10) and one coastal cell
+ * containing (10, -100); (10, 100) stays water.
+ */
+function makeTestMask() {
+  const states = new Uint8Array(16).fill(MASK_WATER);
+  states[2 * 4 + 2] = MASK_LAND; // row 2 = [0,45), col 2 = [0,90)
+  states[2 * 4 + 0] = MASK_COASTAL; // row 2, col 0 = [-180,-90)
+  return decodeMaskBuffer(buildMaskFileBuffer(states, 4, 4));
+}
+
+const LAND_POINT = [10, 10];
+const COASTAL_POINT = [10, -100];
+const WATER_POINT = [10, 100];
+
+/** enable() kicks maskLoader().then(...) — let that microtask chain settle. */
+function flushMicrotasks() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+function makeMaskedLayer(overlayHost, driftSpy, maskLoader) {
+  return createOceanConditionsLayer({
+    overlayHost,
+    driftControllerFactory: () => driftSpy,
+    maskLoader,
+  });
+}
+
+test('mask gate: a land click publishes nothing and probes no forecast', async () => {
+  const overlayHost = makeOverlayHostSpy();
+  const layer = makeMaskedLayer(overlayHost, makeDriftSpy(), async () => makeTestMask());
+  const viewer = makeViewer();
+  const savedFetch = globalThis.fetch;
+  const fetched = [];
+  globalThis.fetch = async (url) => { fetched.push(String(url)); return { ok: false, status: 500 }; };
+  try {
+    layer.init(viewer);
+    layer.enable(viewer);
+    await flushMicrotasks();
+    await layer._selectOceanPointForTest(...LAND_POINT, { x: 1, y: 2, z: 3 });
+    assert.ok(!overlayHost.calls.some(([, sourceId]) => (
+      sourceId === OCEAN_SELECTED_OVERLAY_SOURCE_ID || sourceId === OCEAN_ACTION_OVERLAY_SOURCE_ID
+    )), 'no overlay traffic at all for a land click');
+    assert.ok(!fetched.some((url) => url.includes('/api/ocean/marine')), 'no wasted marine probe');
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+});
+
+test('mask gate: a water click publishes card and DRIFT chip before any marine fetch resolves', async () => {
+  const overlayHost = makeOverlayHostSpy();
+  const driftSpy = makeDriftSpy();
+  const layer = makeMaskedLayer(overlayHost, driftSpy, async () => makeTestMask());
+  const viewer = makeViewer();
+  const savedFetch = globalThis.fetch;
+  globalThis.fetch = (url) => (String(url).includes('/api/ocean/marine')
+    ? new Promise(() => {}) // forecast never resolves — ordering must not depend on it
+    : Promise.resolve(obsResponse([])));
+  try {
+    layer.init(viewer);
+    layer.enable(viewer);
+    await flushMicrotasks();
+    void layer._selectOceanPointForTest(...WATER_POINT, { x: 1, y: 2, z: 3 });
+    const cardCall = overlayHost.calls.find(
+      ([kind, sourceId]) => kind === 'entries' && sourceId === OCEAN_SELECTED_OVERLAY_SOURCE_ID,
+    );
+    const chipCall = overlayHost.calls.find(
+      ([kind, sourceId]) => kind === 'entries' && sourceId === OCEAN_ACTION_OVERLAY_SOURCE_ID,
+    );
+    assert.ok(cardCall, 'coordinate card published synchronously');
+    assert.ok(chipCall, 'DRIFT chip published synchronously — the mask is the water authority');
+    assert.match(chipCall[2][0].title, /DRIFT/);
+    chipCall[2][0].activate();
+    assert.deepEqual(
+      [driftSpy.startCalls[0].lat, driftSpy.startCalls[0].lon],
+      WATER_POINT,
+    );
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+});
+
+test('mask gate: a water click with a failed forecast keeps the chip and appends NO MARINE DATA', async () => {
+  const overlayHost = makeOverlayHostSpy();
+  const layer = makeMaskedLayer(overlayHost, makeDriftSpy(), async () => makeTestMask());
+  const viewer = makeViewer();
+  const savedFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => (String(url).includes('/api/ocean/marine')
+    ? { ok: false, status: 503 }
+    : obsResponse([]));
+  try {
+    layer.init(viewer);
+    layer.enable(viewer);
+    await flushMicrotasks();
+    await layer._selectOceanPointForTest(...WATER_POINT, { x: 1, y: 2, z: 3 });
+    const chipIndex = overlayHost.calls.findIndex(
+      ([kind, sourceId]) => kind === 'entries' && sourceId === OCEAN_ACTION_OVERLAY_SOURCE_ID,
+    );
+    assert.ok(chipIndex !== -1, 'chip published');
+    assert.ok(!overlayHost.calls.slice(chipIndex + 1).some(
+      ([kind, sourceId]) => sourceId === OCEAN_ACTION_OVERLAY_SOURCE_ID,
+    ), 'chip source untouched after publication — never cleared on forecast failure');
+    const lastCard = overlayHost.calls.findLast(
+      ([kind, sourceId]) => kind === 'entries' && sourceId === OCEAN_SELECTED_OVERLAY_SOURCE_ID,
+    );
+    assert.ok(lastCard[2][0].details.includes('NO MARINE DATA'));
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+});
+
+test('mask gate: a coastal click keeps the probe path — card first, chip only after forecast', async () => {
+  const overlayHost = makeOverlayHostSpy();
+  const layer = makeMaskedLayer(overlayHost, makeDriftSpy(), async () => makeTestMask());
+  const viewer = makeViewer();
+  const savedFetch = globalThis.fetch;
+  let resolveMarine = null;
+  globalThis.fetch = (url) => (String(url).includes('/api/ocean/marine')
+    ? new Promise((resolve) => {
+      resolveMarine = () => resolve({ ok: true, json: async () => MARINE_PAYLOAD });
+    })
+    : Promise.resolve(obsResponse([])));
+  try {
+    layer.init(viewer);
+    layer.enable(viewer);
+    await flushMicrotasks();
+    const pending = layer._selectOceanPointForTest(...COASTAL_POINT, { x: 1, y: 2, z: 3 });
+    assert.ok(overlayHost.calls.some(
+      ([kind, sourceId]) => kind === 'entries' && sourceId === OCEAN_SELECTED_OVERLAY_SOURCE_ID,
+    ), 'card published before the forecast resolves');
+    assert.ok(!overlayHost.calls.some(
+      ([kind, sourceId]) => kind === 'entries' && sourceId === OCEAN_ACTION_OVERLAY_SOURCE_ID,
+    ), 'coastal cells never pre-authorize drift');
+    resolveMarine();
+    await pending;
+    assert.ok(overlayHost.calls.some(
+      ([kind, sourceId]) => kind === 'entries' && sourceId === OCEAN_ACTION_OVERLAY_SOURCE_ID,
+    ), 'chip appears once the forecast confirms water');
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+});
+
+test('mask gate: a rejecting maskLoader falls back to the probe path', async () => {
+  const overlayHost = makeOverlayHostSpy();
+  const layer = makeMaskedLayer(
+    overlayHost,
+    makeDriftSpy(),
+    () => Promise.reject(new Error('mask unavailable')),
+  );
+  const viewer = makeViewer();
+  const savedFetch = globalThis.fetch;
+  let resolveMarine = null;
+  globalThis.fetch = (url) => (String(url).includes('/api/ocean/marine')
+    ? new Promise((resolve) => {
+      resolveMarine = () => resolve({ ok: true, json: async () => MARINE_PAYLOAD });
+    })
+    : Promise.resolve(obsResponse([])));
+  try {
+    layer.init(viewer);
+    layer.enable(viewer);
+    await flushMicrotasks();
+    const pending = layer._selectOceanPointForTest(...WATER_POINT, { x: 1, y: 2, z: 3 });
+    assert.ok(!overlayHost.calls.some(
+      ([kind, sourceId]) => kind === 'entries' && sourceId === OCEAN_ACTION_OVERLAY_SOURCE_ID,
+    ), 'no mask means no pre-fetch chip, even over water');
+    resolveMarine();
+    await pending;
+    assert.ok(overlayHost.calls.some(
+      ([kind, sourceId]) => kind === 'entries' && sourceId === OCEAN_ACTION_OVERLAY_SOURCE_ID,
+    ), 'probe path still grants the chip after the forecast');
   } finally {
     globalThis.fetch = savedFetch;
   }
