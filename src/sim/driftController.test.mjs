@@ -8,6 +8,7 @@ import {
   resolveDriftParams,
   DRIFT_OVERLAY_SOURCE_ID,
   DRIFT_DEFAULTS,
+  DRIFT_POSITION_UNCERTAINTY,
 } from './driftController.js';
 import { createDriftPanel } from './driftPanel.js';
 
@@ -415,6 +416,7 @@ test('the panel factory receives control-facing params and a working onRerun', a
     horizonH: DRIFT_DEFAULTS.horizonH,
     n: 8,
     sigmaTurbMs: DRIFT_DEFAULTS.sigmaTurbMs,
+    posSigmaM: DRIFT_DEFAULTS.posSigmaM,
     backward: false,
   });
   assert.equal(typeof seams.panelOptions.onRerun, 'function');
@@ -483,4 +485,153 @@ test('createDriftPanel headless stub keeps the full no-op shape including setSum
   for (const key of ['setFrame', 'setPlaying', 'setSummary', 'destroy']) {
     assert.equal(typeof stub[key], 'function', `stub exposes ${key}`);
   }
+});
+
+// ── Overlapping starts must not leak a run (the A3 defect) ──────────────────
+// start() calls dispose() at entry, which is a no-op while _active is still
+// null, then awaits 0.9–3.9 s of I/O and compute before it assigns _active.
+// Two starts issued inside that window both built a collection and a panel, and
+// only the second was ever reachable by dispose() — the first leaked its GPU
+// collection and DOM panel for the session, and its orphaned panel's callbacks
+// closed over the controller and drove the surviving run.
+//
+// The existing "a second start disposes the first" test AWAITS the first start,
+// so it exercises the sequential path and structurally cannot see this.
+
+test('two overlapping starts leave exactly one collection and one panel alive', async () => {
+  const seams = makeSeams();
+  const collections = [];
+  const panels = [];
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+
+  seams.options.collectionFactory = () => {
+    const collection = makeCollection();
+    collections.push(collection);
+    return collection;
+  };
+  seams.options.panelFactory = () => {
+    const panel = { destroyed: false, setFrame: () => {}, setPlaying: () => {}, setSummary: () => {},
+      destroy() { this.destroyed = true; } };
+    panels.push(panel);
+    return panel;
+  };
+  const runEnsembleFn = seams.options.runEnsembleFn;
+  seams.options.runEnsembleFn = async (params) => {
+    await gate; // both starts are now past their fetches and inside the model
+    return runEnsembleFn(params);
+  };
+
+  const controller = createDriftController(seams.options);
+  const first = controller.start({ lat: 33.5, lon: -118.5, n: 4 });
+  const second = controller.start({ lat: 34.0, lon: -119.0, n: 4 });
+  release();
+  const [firstResult, secondResult] = await Promise.all([first, second]);
+
+  // The superseded run must bail rather than take ownership of the scene.
+  assert.equal(firstResult.ok, false);
+  assert.equal(firstResult.reason, 'superseded');
+  assert.equal(secondResult.ok, true);
+
+  // Exactly one of each was ever built, and the scene holds exactly one.
+  assert.equal(collections.length, 1, 'superseded run must not build a collection');
+  assert.equal(panels.length, 1, 'superseded run must not build a panel');
+  assert.equal(seams.options.viewer.scene.primitives.added.length, 1);
+
+  // And the survivor is fully disposable — nothing is orphaned.
+  controller.dispose();
+  assert.equal(collections[0].destroyed, true);
+  assert.equal(panels[0].destroyed, true);
+});
+
+test('a superseded start never publishes its banner over the winning run', async () => {
+  const seams = makeSeams();
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const runEnsembleFn = seams.options.runEnsembleFn;
+  let calls = 0;
+  seams.options.runEnsembleFn = async (params) => {
+    if (calls++ === 0) await gate;
+    return runEnsembleFn(params);
+  };
+  const controller = createDriftController(seams.options);
+  const first = controller.start({ lat: 33.5, lon: -118.5, n: 4 });
+  const second = controller.start({ lat: 34.0, lon: -119.0, n: 4 });
+  release();
+  await Promise.all([first, second]);
+
+  const banners = seams.overlayCalls.filter(
+    ([kind, sourceId]) => kind === 'entries' && sourceId === DRIFT_OVERLAY_SOURCE_ID,
+  );
+  assert.equal(banners.length, 1, 'only the winning run may publish a banner');
+  controller.dispose();
+});
+
+// ── Last-known-position uncertainty is a physical parameter, not a knob ─────
+
+test('posSigmaM defaults to the estimated band and reaches the model', async () => {
+  const seams = makeSeams();
+  let seen = null;
+  const inner = seams.options.runEnsembleFn;
+  seams.options.runEnsembleFn = (params) => { seen = params; return inner(params); };
+  const controller = createDriftController(seams.options);
+  await controller.start({ lat: 33.5, lon: -118.5, n: 8 });
+  assert.equal(seen.posSigmaM, DRIFT_DEFAULTS.posSigmaM);
+  assert.equal(DRIFT_DEFAULTS.posSigmaM, 1000, 'default is the estimated-position band');
+  controller.dispose();
+});
+
+test('an explicit posSigmaM overrides the default and survives a rerun', async () => {
+  const seams = makeSeams();
+  const seen = [];
+  const inner = seams.options.runEnsembleFn;
+  seams.options.runEnsembleFn = (params) => { seen.push(params.posSigmaM); return inner(params); };
+  const controller = createDriftController(seams.options);
+  await controller.start({ lat: 33.5, lon: -118.5, n: 8, posSigmaM: 5000 });
+  assert.equal(seen[0], 5000);
+  // rerun() replays the REMEMBERED params, so the choice must persist.
+  await controller.rerun({ horizonH: 12 });
+  assert.equal(seen[1], 5000, 'a rerun must not silently revert to the default');
+  controller.dispose();
+});
+
+test('resolveDriftParams clamps posSigmaM to a physically meaningful range', () => {
+  assert.equal(resolveDriftParams({ posSigmaM: -5 }).posSigmaM, 0);
+  assert.equal(resolveDriftParams({ posSigmaM: 1e9 }).posSigmaM, 20000,
+    'a scatter wider than the forcing grid puts particles where the sampler clamps');
+  assert.equal(resolveDriftParams({ posSigmaM: Number.NaN }).posSigmaM, 0);
+  assert.equal(resolveDriftParams({ posSigmaM: 1000 }).posSigmaM, 1000);
+});
+
+test('the offered uncertainty bands span the real range and are ordered', () => {
+  const bands = DRIFT_POSITION_UNCERTAINTY;
+  assert.ok(bands.length >= 3);
+  for (let i = 1; i < bands.length; i += 1) {
+    assert.ok(bands[i].posSigmaM > bands[i - 1].posSigmaM, 'bands must ascend');
+  }
+  // Every band must be reachable through the clamp, or the control lies.
+  for (const band of bands) {
+    assert.equal(resolveDriftParams({ posSigmaM: band.posSigmaM }).posSigmaM, band.posSigmaM, band.id);
+    assert.match(band.label, /\d/, 'the label must state the actual distance');
+  }
+  assert.ok(bands.some((b) => b.posSigmaM === DRIFT_DEFAULTS.posSigmaM),
+    'the default must correspond to an offered band');
+});
+
+test('the panel offers exactly the controller’s uncertainty bands', async () => {
+  // POSITION_CHOICES is declared inside driftPanel to avoid a cycle (the
+  // controller imports the panel). This pins that the duplicate cannot drift:
+  // a band offered in the UI that the physics clamps away, or a band the
+  // physics supports that the UI hides, would both be silent.
+  const { POSITION_CHOICES } = await import('./driftPanel.js');
+  assert.deepEqual(
+    POSITION_CHOICES.map((b) => b.posSigmaM),
+    DRIFT_POSITION_UNCERTAINTY.map((b) => b.posSigmaM),
+    'panel choices and controller bands must be the same values, in the same order',
+  );
+  assert.deepEqual(
+    POSITION_CHOICES.map((b) => b.label),
+    DRIFT_POSITION_UNCERTAINTY.map((b) => b.label),
+    'labels must agree too — the panel is what the user reads',
+  );
 });

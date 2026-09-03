@@ -473,3 +473,74 @@ test('every frame stays finite even when forcing has NaN holes', () => {
   assert.equal(result.frames.length, result.timesMs.length * 128 * 2);
   for (const value of result.frames) assert.ok(Number.isFinite(value));
 });
+
+// ── Time-axis clamping is a distinct failure from a value gap (the A2 defect) ──
+// bracket() clamps a time past the end of hoursMs to the last hour with w = 0,
+// silently freezing the field. `degraded` only ever tripped on non-finite
+// SAMPLES, so a run integrating past the end of its forecast reported itself
+// perfectly healthy. Under the old forecast_days=2 every 48 h run did exactly
+// that; these pin the two signals apart.
+
+test('makeForcingSampler reports clampedInTime only outside the time axis', () => {
+  const grid = constantGrid({ curU: 0.5 });
+  const sampler = makeForcingSampler(grid);
+  const [t0, t1] = grid.hoursMs;
+
+  const inside = sampler(SEED_LAT, SEED_LON, (t0 + t1) / 2);
+  assert.equal(inside.clampedInTime, false);
+  assert.equal(inside.degraded, false);
+
+  // Exactly on the endpoints is still inside the axis.
+  assert.equal(sampler(SEED_LAT, SEED_LON, t0).clampedInTime, false);
+  assert.equal(sampler(SEED_LAT, SEED_LON, t1).clampedInTime, false);
+
+  const past = sampler(SEED_LAT, SEED_LON, t1 + 3600e3);
+  assert.equal(past.clampedInTime, true);
+  // Clamping is NOT a value gap: the field is frozen, not missing.
+  assert.equal(past.degraded, false);
+  assert.equal(past.curU, 0.5);
+
+  assert.equal(sampler(SEED_LAT, SEED_LON, t0 - 3600e3).clampedInTime, true);
+});
+
+test('a run inside its forcing axis reports no clamped frames', () => {
+  const grid = constantGrid({ curU: 0.2 });
+  const result = runEnsemble({
+    n: 4,
+    seedLat: SEED_LAT,
+    seedLon: SEED_LON,
+    startTimeMs: grid.hoursMs[0],
+    horizonH: 12, // well inside the 24 h axis
+    dtMin: 10,
+    grid,
+    rngSeed: 1,
+  });
+  assert.equal(result.clampedInTime, false);
+  assert.equal(result.clampedFrames, 0);
+  assert.equal(result.frameCount, result.timesMs.length);
+});
+
+test('a run past the end of its forcing axis counts the extrapolated frames', () => {
+  const grid = constantGrid({ curU: 0.2 });
+  const axisHours = (grid.hoursMs[1] - grid.hoursMs[0]) / 3600e3; // 24 h
+  const horizonH = 36;
+  const result = runEnsemble({
+    n: 4,
+    seedLat: SEED_LAT,
+    seedLon: SEED_LON,
+    startTimeMs: grid.hoursMs[0],
+    horizonH,
+    dtMin: 10,
+    grid,
+    rngSeed: 1,
+  });
+  assert.equal(result.clampedInTime, true);
+  // Frames are stamped at t0 + step·dt; those beyond the 24 h axis are clamped.
+  // 36 h at 10 min = 216 steps, of which the last 12 h = 72 fall past the axis.
+  const expected = Math.round(((horizonH - axisHours) * 60) / 10);
+  assert.equal(result.clampedFrames, expected);
+  // The frozen tail is still finite — clamping degrades honesty, not arithmetic.
+  assert.ok(Number.isFinite(result.meanEndLat) && Number.isFinite(result.meanEndLon));
+  // And it is NOT reported as a value gap.
+  assert.equal(result.degraded, false);
+});

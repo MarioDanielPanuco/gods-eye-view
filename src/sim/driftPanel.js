@@ -10,6 +10,20 @@
 const HORIZON_CHOICES = [6, 12, 24, 48];
 const PARTICLE_CHOICES = [2000, 10000, 25000];
 const SIGMA_CHOICES = [0, 0.05, 0.1];
+/**
+ * Last-known-position uncertainty bands, 1-sigma metres and their labels.
+ *
+ * Declared here rather than imported because driftController imports THIS
+ * module, so reaching back would be a cycle — the same reason HORIZON_CHOICES
+ * and PARTICLE_CHOICES are local. `DRIFT_POSITION_UNCERTAINTY` in
+ * driftController is the authority on the physics; driftPanel.test.mjs pins
+ * that the two agree, so they cannot drift apart silently.
+ */
+export const POSITION_CHOICES = [
+  { posSigmaM: 300, label: 'witnessed · 300 m' },
+  { posSigmaM: 1000, label: 'estimated · 1 km' },
+  { posSigmaM: 5000, label: 'uncertain · 5 km' },
+];
 
 /**
  * @param {Object} options
@@ -19,10 +33,10 @@ const SIGMA_CHOICES = [0, 0.05, 0.1];
  * @param {number} options.horizonH Simulation horizon, hours.
  * @param {boolean} [options.degraded] Forcing gaps were zero-filled.
  * @param {Object} [options.params] Current run params seeding the controls:
- *   {horizonH, n, sigmaTurbMs, backward}. `backward` also flips the clock
+ *   {horizonH, n, sigmaTurbMs, posSigmaM, backward}. `backward` also flips the clock
  *   label to `T−hh:mm`.
  * @param {(params: {horizonH: number, n: number, sigmaTurbMs: number,
- *   backward: boolean}) => void} [options.onRerun] Called with the controls'
+ *   posSigmaM: number, backward: boolean}) => void} [options.onRerun] Called with the controls'
  *   current values when RERUN is pressed (selects never auto-rerun).
  * @param {(index: number) => void} options.onScrub
  * @param {() => void} options.onPlayPause
@@ -36,6 +50,7 @@ export function createDriftPanel({
   frameCount,
   horizonH,
   degraded = false,
+  forcing = null,
   params = null,
   onRerun,
   onScrub,
@@ -81,6 +96,29 @@ export function createDriftPanel({
   meta.appendChild(beached);
   root.appendChild(meta);
 
+  // Forcing-quality line. The layer's entire quality surface used to be one
+  // latching boolean that read `true` on every coastal run and therefore
+  // carried no information. These are the numbers that actually bound the
+  // answer: how many forcing nodes had data, how far upstream moved each node
+  // from where it was asked for, and how much of the run ran past the end of
+  // the forecast. Hidden when the proxy reported nothing (older payloads).
+  if (forcing && Number.isFinite(forcing.nodesTotal)) {
+    const parts = [];
+    const live = forcing.nodesTotal - (forcing.nodesDropped ?? 0);
+    parts.push(`${live}/${forcing.nodesTotal} forcing nodes`);
+    if (Number.isFinite(forcing.maxNodeSnapM)) {
+      parts.push(`max node snap ${(forcing.maxNodeSnapM / 1000).toFixed(1)} km`);
+    }
+    const clamped = forcing.clampedFrames ?? 0;
+    parts.push(clamped > 0
+      ? `⚠ ${clamped}/${forcing.frameCount} frames past forecast end`
+      : '0 frames extrapolated');
+    const quality = document.createElement('div');
+    quality.textContent = parts.join(' · ');
+    quality.style.cssText = `color:${clamped > 0 ? '#ffb14d' : '#7f97a5'};margin-bottom:2px;`;
+    root.appendChild(quality);
+  }
+
   // Diagnostics line (mean drift + spread) — hidden until setSummary(text).
   const summary = document.createElement('div');
   summary.hidden = true;
@@ -119,6 +157,13 @@ export function createDriftPanel({
     PARTICLE_CHOICES, params?.n, (v) => v.toLocaleString());
   const sigmaSelect = makeSelect('σ', 'Turbulence sigma, m/s',
     SIGMA_CHOICES, params?.sigmaTurbMs, (v) => `${v} m/s`);
+  // Last-known-position uncertainty. Labelled by what it MEANS, not by the
+  // symbol: it is how well the entry point is known, and the reported spread is
+  // uninterpretable without it. Rendered as its band name so nobody reads it as
+  // a display setting.
+  const positionSelect = makeSelect('⌖', 'Last known position uncertainty',
+    POSITION_CHOICES.map((band) => band.posSigmaM), params?.posSigmaM,
+    (v) => POSITION_CHOICES.find((band) => band.posSigmaM === v)?.label ?? `${v} m`);
 
   // Direction toggle — a stateful button, applied only on RERUN.
   let backwardChoice = backward;
@@ -146,6 +191,7 @@ export function createDriftPanel({
     horizonH: Number(horizonSelect.value),
     n: Number(particlesSelect.value),
     sigmaTurbMs: Number(sigmaSelect.value),
+    posSigmaM: Number(positionSelect.value),
     backward: backwardChoice,
   }));
   paramsRow.appendChild(rerunButton);

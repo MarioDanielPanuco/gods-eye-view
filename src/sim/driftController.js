@@ -24,6 +24,29 @@ const GRID_URL = '/api/ocean/marine-grid';
 const ETOPO_URL = '/api/ocean/etopo';
 
 /**
+ * Last-known-position uncertainty presets, metres (1-sigma).
+ *
+ * This is the standard deviation of the ensemble's INITIAL POSITION SCATTER —
+ * how well the entry point is known — not a display parameter. It is exposed
+ * because the honest value differs by more than an order of magnitude between a
+ * witnessed man-overboard and a position reconstructed hours later, and because
+ * the answer the panel reports is meaningless without it.
+ *
+ * The bands follow SAR practice for initial position error: a witnessed MOB
+ * with a mark dropped immediately is O(100 m); a position estimated from a
+ * track and a time is O(1 km); a last-known-position inferred from a missed
+ * check-in or a partial report is several km. NOT sourced to a specific
+ * publication — treat the boundaries as round numbers chosen to span the real
+ * range, and set the value deliberately rather than accepting a default.
+ * @const {ReadonlyArray<{id: string, label: string, posSigmaM: number}>}
+ */
+export const DRIFT_POSITION_UNCERTAINTY = Object.freeze([
+  Object.freeze({ id: 'witnessed', label: 'witnessed · 300 m', posSigmaM: 300 }),
+  Object.freeze({ id: 'estimated', label: 'estimated · 1 km', posSigmaM: 1000 }),
+  Object.freeze({ id: 'uncertain', label: 'uncertain · 5 km', posSigmaM: 5000 }),
+]);
+
+/**
  * Ensemble defaults, sized by the frame-buffer formula
  * n · (60·horizonH/dtMin + 1) frames · 2 floats · 4 bytes:
  * 10⁴ · 145 · 8 B ≈ 11.6 MB — comfortably transferable and scrubbable.
@@ -33,7 +56,9 @@ export const DRIFT_DEFAULTS = Object.freeze({
   n: 10000,
   horizonH: 24,
   dtMin: 10,
-  posSigmaM: 300,
+  // Default: the middle band. A drift answer quoted from a 300 m assumption
+  // when the position was actually estimated understates the search area.
+  posSigmaM: 1000,
   sigmaTurbMs: 0.05,
 });
 
@@ -55,13 +80,19 @@ const DRIFT_FRAME_BUDGET_BYTES = 32 * 1024 * 1024;
  * @param {number} [overrides.horizonH] Simulation horizon, hours.
  * @param {number} [overrides.n] Ensemble size (clamped to [1, 25000]).
  * @param {number} [overrides.sigmaTurbMs] Turbulent-diffusion σ, m/s.
+ * @param {number} [overrides.posSigmaM] Last-known-position uncertainty, metres
+ *   (1-sigma initial scatter). Clamped to [0, 20000]: this is a physical
+ *   uncertainty, and a scatter wider than the forcing grid would put particles
+ *   where the sampler clamps and the answer stops meaning anything.
  * @param {boolean} [overrides.backward] Reverse (hindcast) drift.
- * @returns {{horizonH: number, dtMin: number, n: number, sigmaTurbMs: number, backward: boolean}}
+ * @returns {{horizonH: number, dtMin: number, n: number, sigmaTurbMs: number,
+ *   posSigmaM: number, backward: boolean}}
  */
 export function resolveDriftParams({
   horizonH = DRIFT_DEFAULTS.horizonH,
   n = DRIFT_DEFAULTS.n,
   sigmaTurbMs = DRIFT_DEFAULTS.sigmaTurbMs,
+  posSigmaM = DRIFT_DEFAULTS.posSigmaM,
   backward = false,
 } = {}) {
   const clampedN = Math.min(DRIFT_MAX_PARTICLES, Math.max(1, Math.floor(n)));
@@ -71,7 +102,13 @@ export function resolveDriftParams({
   if (bytes >= DRIFT_FRAME_BUDGET_BYTES) {
     throw new Error(`drift frame buffer ${bytes} B exceeds the ${DRIFT_FRAME_BUDGET_BYTES} B budget`);
   }
-  return { horizonH, dtMin, n: clampedN, sigmaTurbMs, backward: Boolean(backward) };
+  // Clamped to the offered range: a negative sigma is meaningless and an
+  // enormous one would scatter particles across the forcing grid's edge, where
+  // the sampler clamps and the answer stops meaning anything.
+  const clampedSigma = Math.min(20000, Math.max(0, Number(posSigmaM) || 0));
+  return {
+    horizonH, dtMin, n: clampedN, sigmaTurbMs, posSigmaM: clampedSigma, backward: Boolean(backward),
+  };
 }
 
 const EARTH_RADIUS_KM = 6371;
@@ -228,6 +265,14 @@ export function createDriftController({
   let _active = null; // {collection, points, timesMs, frames, beachedAtFrame, n, frameIndex, panel, playTimer}
   let _lastSeed = null; // {lat, lon, label} of the most recent start()
   let _lastParams = null; // {horizonH, n, sigmaTurbMs, backward} resolved for it
+  // Monotonic token identifying the in-flight start(). start() awaits 0.9–3.9 s
+  // of network and compute (measured: grid 195–812 ms, runEnsemble 1094 ms at
+  // n = 10⁴, 2490 ms at 25 k) before it touches _active, and dispose() only
+  // ever reaches the CURRENT _active. Two overlapping starts therefore used to
+  // leak the first run's GPU collection and DOM panel permanently — and worse,
+  // the orphaned panel's onScrub/onClose closed over this controller and drove
+  // the surviving run. Every await below re-checks this token.
+  let _runToken = 0;
 
   function dispose() {
     if (!_active) return;
@@ -292,14 +337,17 @@ export function createDriftController({
    * through {@link resolveDriftParams} (dtMin is derived from the horizon);
    * the seed and resolved params are remembered for {@link rerun}.
    */
-  async function start({ lat, lon, label = '', horizonH, n, sigmaTurbMs, backward } = {}) {
+  async function start({ lat, lon, label = '', horizonH, n, sigmaTurbMs, posSigmaM, backward } = {}) {
+    const token = _runToken + 1;
+    _runToken = token;
     dispose();
-    const runParams = resolveDriftParams({ horizonH, n, sigmaTurbMs, backward });
+    const runParams = resolveDriftParams({ horizonH, n, sigmaTurbMs, posSigmaM, backward });
     _lastSeed = { lat, lon, label };
     _lastParams = {
       horizonH: runParams.horizonH,
       n: runParams.n,
       sigmaTurbMs: runParams.sigmaTurbMs,
+      posSigmaM: runParams.posSigmaM,
       backward: runParams.backward,
     };
     const params = new URLSearchParams({ latitude: lat.toFixed(4), longitude: lon.toFixed(4) });
@@ -308,9 +356,9 @@ export function createDriftController({
       fetchImpl(`${GRID_URL}?${params}`).then((r) => (r.ok ? r.json() : null)),
       fetchImpl(`${ETOPO_URL}?${params}`).then((r) => (r.ok ? r.json() : null)),
     ]);
-    const grid = gridSettled.status === 'fulfilled' && gridSettled.value
-      ? normalizeForcingGrid(gridSettled.value)
-      : null;
+    if (token !== _runToken) return { ok: false, reason: 'superseded' };
+    const gridPayload = gridSettled.status === 'fulfilled' ? gridSettled.value : null;
+    const grid = gridPayload ? normalizeForcingGrid(gridPayload) : null;
     if (!grid) return { ok: false, reason: 'marine forcing grid unavailable' };
 
     // Beaching forcing: ETOPO bathymetry (~3.7 km) → bundled 1/8° bitmask →
@@ -324,6 +372,7 @@ export function createDriftController({
     } else {
       try {
         const mask = await maskLoaderFn();
+        if (token !== _runToken) return { ok: false, reason: 'superseded' };
         if (mask) landMask = { type: 'mask', width: mask.width, height: mask.height, data: mask.data };
       } catch {
         landMask = null;
@@ -344,11 +393,13 @@ export function createDriftController({
         grid,
         landMask,
         rngSeed: Date.now() >>> 0,
-        posSigmaM: DRIFT_DEFAULTS.posSigmaM,
+        posSigmaM: runParams.posSigmaM,
       });
     } catch {
       return { ok: false, reason: 'drift ensemble failed' };
     }
+    // Last gate before this run takes ownership of the scene and the DOM.
+    if (token !== _runToken) return { ok: false, reason: 'superseded' };
 
     const collection = collectionFactory();
     const points = [];
@@ -374,6 +425,14 @@ export function createDriftController({
       frameCount: result.timesMs.length,
       horizonH: runParams.horizonH,
       degraded: Boolean(result.degraded),
+      // The honest quality surface: node counts, how far upstream moved each
+      // node from where it was asked for, and how many frames ran past the end
+      // of the forecast. A latching boolean read `true` on every coastal run.
+      forcing: {
+        ...(gridPayload?.validation ?? {}),
+        clampedFrames: result.clampedFrames ?? 0,
+        frameCount: result.timesMs.length,
+      },
       label,
       params: { ..._lastParams },
       onRerun: (overrides) => rerun(overrides),
@@ -407,7 +466,10 @@ export function createDriftController({
       title: 'SIMULATED DRIFT ENSEMBLE',
       details: [`${result.n.toLocaleString()} particles · ${runParams.horizonH} h · PIW`,
         ...(runParams.backward ? ['REVERSE DRIFT — origin hypothesis'] : []),
-        ...(result.degraded ? ['⚠ forcing gaps zero-filled'] : [])],
+        ...(result.degraded ? ['⚠ forcing gaps zero-filled'] : []),
+        ...(result.clampedFrames > 0
+          ? [`⚠ ${result.clampedFrames}/${result.timesMs.length} frames past forecast end`]
+          : [])],
       accent: '#ffb14d',
       interactive: false,
       verticalOnly: true,
@@ -440,5 +502,7 @@ export function createDriftController({
     pause,
     dispose,
     isActive: () => Boolean(_active),
+    /** True while a start() is between its first await and taking ownership. */
+    isBusy: () => _runToken > 0 && !_active,
   };
 }

@@ -145,11 +145,20 @@ export function makeForcingSampler(grid) {
     return { i0: i, i1: i + 1, w: span > 0 ? (x - values[i]) / span : 0 };
   };
 
+  const firstHourMs = hoursMs[0];
+  const lastHourMs = hoursMs[hoursMs.length - 1];
+
   return (lat, lon, tMs) => {
     const bLat = bracket(lats, lat);
     const bLon = bracket(lons, lon);
     const bT = bracket(hoursMs, tMs);
     let degraded = false;
+    // A time outside the forcing axis is clamped to the end hour by bracket(),
+    // which silently freezes the field rather than failing. That is a DIFFERENT
+    // failure from a NaN value and must be reported separately: `degraded` only
+    // ever tripped on non-finite samples, so a run integrating hours past the
+    // end of the forecast reported itself perfectly healthy.
+    const clampedInTime = tMs < firstHourMs || tMs > lastHourMs;
 
     const cell = (field, t, iLat, iLon) => {
       const value = field[(t * NLAT + iLat) * NLON + iLon];
@@ -178,6 +187,7 @@ export function makeForcingSampler(grid) {
       windU: sample(grid.windU),
       windV: sample(grid.windV),
       degraded,
+      clampedInTime,
     };
   };
 }
@@ -276,7 +286,12 @@ function haversineKm(lat1, lon1, lat2, lon2) {
  *   the pre-beaching model).
  * @returns {{timesMs: Float64Array, frames: Float32Array,
  *   beachedAtFrame: Int32Array, n: number, degraded: boolean,
+ *   clampedInTime: boolean, clampedFrames: number, frameCount: number,
  *   meanEndLat: number, meanEndLon: number, spreadKm: number}}
+ *   `degraded` reports non-finite forcing SAMPLES (zero-filled); the separate
+ *   `clampedInTime`/`clampedFrames` report integration past the ends of the
+ *   forcing time axis, where the field is frozen at its end hour. The two are
+ *   different failures and a run can have either without the other.
  *   `frames` is frame-major `[lon, lat]` pairs: `frames[(t·n + i)·2]` = lon.
  *   `beachedAtFrame[i]` is the first frame particle i is frozen (−1 = never);
  *   frames stay dense — a beached particle re-records its last water position.
@@ -341,6 +356,8 @@ export function runEnsemble({
   const frames = new Float32Array((steps + 1) * n * 2);
   const beachedAtFrame = new Int32Array(n).fill(-1);
   let degraded = false;
+  let clampedFrames = 0;
+  let clampedInTime = false;
 
   const record = (frame) => {
     const offset = frame * n * 2;
@@ -364,6 +381,7 @@ export function runEnsemble({
   const stageRate = (i, pLat, pLon, tMs, du, dv) => {
     const forcing = sampler(pLat, pLon, tMs);
     if (forcing.degraded) degraded = true;
+    if (forcing.clampedInTime) clampedInTime = true;
 
     let vE = forcing.curU + du;
     let vN = forcing.curV + dv;
@@ -439,6 +457,10 @@ export function runEnsemble({
       if (jibeP > 0 && rng() < jibeP) crossSign[i] = -crossSign[i];
     }
     timesMs[step] = t1;
+    // Frames whose own timestamp falls outside the forcing axis are integrated
+    // on a frozen end-hour field; count them so the panel can say how much of
+    // the run is extrapolation rather than forecast.
+    if (t1 < grid.hoursMs[0] || t1 > grid.hoursMs[grid.hoursMs.length - 1]) clampedFrames += 1;
     record(step);
   }
 
@@ -458,5 +480,17 @@ export function runEnsemble({
   }
   const spreadKm = n > 0 ? Math.sqrt(sumSqKm / n) : 0;
 
-  return { timesMs, frames, beachedAtFrame, n, degraded, meanEndLat, meanEndLon, spreadKm };
+  return {
+    timesMs,
+    frames,
+    beachedAtFrame,
+    n,
+    degraded,
+    clampedInTime,
+    clampedFrames,
+    frameCount: steps + 1,
+    meanEndLat,
+    meanEndLon,
+    spreadKm,
+  };
 }
