@@ -629,3 +629,47 @@ test('source pins: no CallbackProperty, no continuous-render hold', () => {
   assert.doesNotMatch(source, /new Cesium\.CallbackProperty/);
   assert.doesNotMatch(source, /holdContinuousRender/);
 });
+
+// ── Direction semantics are pinned, not implied by a glyph ──────────────────
+// NDBC documents MWD and WDIR as the direction the waves/wind come FROM
+// (ndbc.noaa.gov/measdes.shtml), and Open-Meteo's wind_direction_10m is
+// meteorological FROM, while its ocean_current_direction is oceanographic TO.
+// Three of the four used to render behind the same `→`, on cards that can show
+// both at once. leeway.js calls this asymmetry "the classic leeway sign bug";
+// these assert the card says which is which, in words.
+
+test('buoy cards state wave and wind directions as FROM, never as a bare arrow', () => {
+  const lines = formatBuoyCardLines({
+    stationId: '46042',
+    name: 'Monterey Bay',
+    waveHeightM: 2.1,
+    dominantPeriodS: 11,
+    waveDirDeg: 295,
+    windSpeedMs: 7.2,
+    gustMs: 9.1,
+    windDirDeg: 320,
+  }).join('\n');
+  assert.match(lines, /2\.1 m @ 11 s from 295°/);
+  assert.match(lines, /7\.2 m\/s G 9\.1 from 320°/);
+  assert.doesNotMatch(lines, /→/, 'a bare arrow does not say FROM or TOWARD');
+});
+
+test('forecast lines state current as TOWARD and wind as FROM', () => {
+  const hourMs = Date.UTC(2026, 8, 1, 12, 0);
+  const lines = formatMarineForecastLines({
+    marine: {
+      time: ['2026-09-01T12:00'],
+      ocean_current_velocity: [3.6],   // km/h → 1.0 m/s
+      ocean_current_direction: [90],   // oceanographic: flowing TOWARD 90°
+      wave_height: [1.4],
+    },
+    wind: {
+      time: ['2026-09-01T12:00'],
+      wind_speed_10m: [6],
+      wind_direction_10m: [270],       // meteorological: blowing FROM 270°
+    },
+  }, hourMs).join('\n');
+  assert.match(lines, /1\.0 m\/s toward 90°/);
+  assert.match(lines, /6\.0 m\/s from 270°/);
+  assert.doesNotMatch(lines, /→/);
+});

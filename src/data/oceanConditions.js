@@ -103,13 +103,13 @@ export function formatBuoyCardLines(record) {
   if (Number.isFinite(record?.waveHeightM)) {
     let wave = `🌊 ${record.waveHeightM.toFixed(1)} m`;
     if (Number.isFinite(record?.dominantPeriodS)) wave += ` @ ${record.dominantPeriodS} s`;
-    if (Number.isFinite(record?.waveDirDeg)) wave += ` → ${Math.round(record.waveDirDeg)}°`;
+    if (Number.isFinite(record?.waveDirDeg)) wave += ` from ${Math.round(record.waveDirDeg)}°`;
     lines.push(wave);
   }
   if (Number.isFinite(record?.windSpeedMs)) {
     let wind = `💨 ${record.windSpeedMs.toFixed(1)} m/s`;
     if (Number.isFinite(record?.gustMs)) wind += ` G ${record.gustMs.toFixed(1)}`;
-    if (Number.isFinite(record?.windDirDeg)) wind += ` → ${Math.round(record.windDirDeg)}°`;
+    if (Number.isFinite(record?.windDirDeg)) wind += ` from ${Math.round(record.windDirDeg)}°`;
     lines.push(wind);
   }
   const temps = [];
@@ -148,7 +148,7 @@ export function formatMarineForecastLines(payload, nowMs) {
     const currentMs = kmhToMs(at(marine.ocean_current_velocity, marineIdx));
     const currentDir = at(marine.ocean_current_direction, marineIdx);
     if (currentMs !== null) {
-      lines.push(`🌀 FC ${currentMs.toFixed(1)} m/s${currentDir !== null ? ` → ${Math.round(currentDir)}°` : ''}`);
+      lines.push(`🌀 FC ${currentMs.toFixed(1)} m/s${currentDir !== null ? ` toward ${Math.round(currentDir)}°` : ''}`);
     }
   }
 
@@ -159,7 +159,7 @@ export function formatMarineForecastLines(payload, nowMs) {
     const speed = at(wind.wind_speed_10m, windIdx);
     const dir = at(wind.wind_direction_10m, windIdx);
     if (speed !== null) {
-      lines.push(`💨 FC ${speed.toFixed(1)} m/s${dir !== null ? ` → ${Math.round(dir)}°` : ''}`);
+      lines.push(`💨 FC ${speed.toFixed(1)} m/s${dir !== null ? ` from ${Math.round(dir)}°` : ''}`);
     }
   }
 
