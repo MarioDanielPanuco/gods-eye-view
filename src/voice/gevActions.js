@@ -184,6 +184,14 @@ const LAYER_ALIASES = new Map([
   ['waves', 'ocean-conditions'],
   ['marine', 'ocean-conditions'],
   ['ndbc', 'ocean-conditions'],
+  // The current FIELD is a different layer from the buoy observations, and
+  // "ocean currents" resolved to the buoys because it had no aliases at all.
+  // Bare 'ocean' stays with ocean-conditions: it is the more general request.
+  ['ocean currents', 'ocean-field'],
+  ['ocean current', 'ocean-field'],
+  ['currents', 'ocean-field'],
+  ['current field', 'ocean-field'],
+  ['surface currents', 'ocean-field'],
 ]);
 
 const CITY_ALIASES = new Map([
