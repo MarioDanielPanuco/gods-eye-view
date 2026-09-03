@@ -179,7 +179,7 @@ Twenty-eight tools, four jobs — the commands below come straight from the prod
 
 ## 🛰️ What's on the Globe
 
-Thirteen live layers. **Ten of them need nothing at all** — no key, no account, no signup.
+Fifteen live layers. **Twelve of them need nothing at all** — no key, no account, no signup.
 
 | Layer | What you get | Source | Auth |
 |-------|--------------|--------|------|
@@ -196,6 +196,8 @@ Thirteen live layers. **Ten of them need nothing at all** — no key, no account
 | 🔥 **Active Fires** | Live NASA FIRMS detections, trailing 24h | NASA FIRMS | 🟡 |
 | 🚀 **Space Missions** | Rolling 30-day launches with payload, stage, and recovery detail | Launch Library 2 | 🟢 (🟡 optional token raises the allowance) |
 | 🎖️ **Mapped Installations** | Viewport-bounded military-site context from community mapping — incomplete by nature, and labeled that way | OpenStreetMap | 🟢 |
+| 🌊 **Ocean Conditions** | ~900 NDBC buoys — waves, wind, SST, pressure — plus marine forecast lines, and a person-in-water drift ensemble on any ocean click | NOAA NDBC · Open-Meteo Marine | 🟢 |
+| 🌀 **Ocean Currents** | The surface-current field itself, animated: HF radar at 1–6 km where the network reaches, the HYCOM global forecast everywhere else (0.25° altimetry as fallback), each labeled with its age, physics and coverage | IOOS HF radar · US Navy HYCOM · NOAA CoastWatch | 🟢 |
 
 **Also on the globe:** neighborhood overlays · an optional cockpit WX cloud effect. **Bundled static infrastructure:** Datacenters (4,351), Dams (704), and Submarine Cables (712).
 

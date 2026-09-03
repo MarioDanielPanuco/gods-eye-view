@@ -1,6 +1,48 @@
 # God's Eye View Current State
 
-Updated: August 24, 2026
+Updated: September 1, 2026
+
+> **2026-09-01 — Ocean Currents field** (`src/data/oceanField.js`,
+> `src/data/oceanFieldMath.js`, `src/server/ocean/*`, `/api/ocean/field`,
+> layer id `ocean-field`, share token `n`). The surface-current field is now
+> **drawn**, as nullschool-style animated streaklines on a 2-D canvas layered
+> over the globe (`#ocean-field-canvas`, z-index 2, below `#world-overlay-root`).
+>
+> **Why a canvas and a raster.** Particles are advected in SCREEN space:
+> unprojecting 4,000 particles per frame is unaffordable, so the layer rebuilds
+> a coarse screen-space velocity raster (one node per 16 px) whenever the camera
+> settles, each node holding the screen displacement of one second of the local
+> current. Particles bilinearly interpolate that raster. A cell touching any
+> no-data node is refused, so a particle at the edge of coverage is retired
+> rather than advected on a half-invented velocity.
+>
+> **Two tiers, always named on screen.** `/api/ocean/field` analyses IOOS
+> HF-radar totals (1–6 km, hourly) through QC gates and two-pass Barnes where
+> the network reaches, and fills the rest from the **HYCOM ESPC-D-V02** global
+> forecast (0.04°×0.08°, 3-hourly, carries tides and wind drift), falling back
+> to NOAA CoastWatch's blended geostrophic 0.25° analysis when HYCOM is
+> unreachable. Measured live 2026-09-01 over a 0.6° box off Monterey:
+> 629 QC-passing vectors, holdout RMSE **0.069 m/s**, 99.9% coverage on a 72×57
+> lattice at ~0.95 km. The legend renders from `provenance` and distinguishes
+> `OBSERVED` (radar, hours old) from `MODELED` — naming which global product
+> served and what physics it carries, since the two fills are not equivalent.
+>
+> **Coverage is measured over water, not over the view** (`waterCells.js`,
+> using the bundled GSHHG mask). Counting land against a coastal analysis
+> demoted exactly the views HF radar exists for: the same radar hour scored 20%
+> over a 1°×1° box centred on Monterey Bay and 99.9% over a box moved offshore.
+> Land cells are blanked rather than drawn — Barnes extrapolates up to 3L.
+>
+> **Three drift defects fixed alongside**, because the field shares the forcing
+> pipeline: the marine grid is georeferenced to the coordinates Open-Meteo
+> **served** rather than requested (3.82 km median / 3.87 km max over the
+> Monterey grid, bounded by the 5.94 km cell half-diagonal at 36.8°N, worth
+> 1.315 km on a 10.2 km 24 h drift) — a separate population, the nodes upstream
+> answered with a *different* cell's water because the request landed on land,
+> was observed up to 22.5 km away and is now **dropped** rather than
+> georeferenced at all; `forecast_days` now covers the 48 h
+> horizon the panel offers, and time clamping is reported separately from value
+> gaps; and overlapping `start()` calls no longer leak a collection and a panel.
 
 > **2026-08-23 — first-run mission launcher** (`src/firstRunExperience.js`,
 > `#first-run-launcher`, styles at the tail of `style.css`). After startup
