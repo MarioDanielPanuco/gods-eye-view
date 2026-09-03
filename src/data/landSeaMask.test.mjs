@@ -3,7 +3,12 @@ import assert from 'node:assert/strict';
 import { statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
-import { loadLandSeaMask, maskStateAt, MASK_WATER, MASK_LAND, MASK_COASTAL } from './landSeaMask.js';
+// The NODE loader: this test runs under node:test and asserts the committed
+// bytes. `data/landSeaMask.js` is the browser half and fetches an asset URL.
+import {
+  loadLandSeaMaskNode as loadLandSeaMask,
+  maskStateAt, MASK_WATER, MASK_LAND, MASK_COASTAL,
+} from '../server/landSeaMaskNode.js';
 
 const ASSET_URL = new URL('./local_data/gshhg_mask/land-sea-mask.bin', import.meta.url);
 
