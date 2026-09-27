@@ -58,6 +58,20 @@ function unwrapRing(points) {
   if (deltaClose > 180) deltaClose -= 360;
   else if (deltaClose < -180) deltaClose += 360;
   const net = Math.round((lons[n - 1] + deltaClose - lons[0]) / 360);
+  if (net !== 0) {
+    // The pole seam drops straight down vertex 0's meridian. Started at the
+    // southernmost vertex nothing of the ring lies below it, so the seam
+    // crosses no shoreline; from any other vertex it can cut through a bay
+    // and flip the ocean behind it to land.
+    let south = 0;
+    for (let i = 1; i < n; i += 1) if (lats[i] < lats[south]) south = i;
+    if (south !== 0) {
+      const rotated = new Float64Array(points.length);
+      rotated.set(points.subarray(south * 2));
+      rotated.set(points.subarray(0, south * 2), points.length - south * 2);
+      return unwrapRing(rotated);
+    }
+  }
   return { lons, lats, net };
 }
 

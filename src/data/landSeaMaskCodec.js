@@ -141,8 +141,11 @@ export function decodeMaskBuffer(buffer) {
  * @param {number} lat - Degrees; +90 clamps into the top row.
  * @param {number} lon - Degrees, any range (wrapped).
  * @returns {number} MASK_WATER | MASK_LAND | MASK_COASTAL (3 reserved).
+ *   A non-finite lat or lon reads as MASK_COASTAL — never trusted as land or
+ *   water — rather than indexing NaN into a silent MASK_WATER.
  */
 export function maskStateAt(mask, lat, lon) {
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return MASK_COASTAL;
   const col = Math.min(
     mask.width - 1,
     Math.max(0, Math.floor(((wrapLon(lon) + 180) * mask.width) / 360)),

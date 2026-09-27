@@ -90,6 +90,25 @@ test('globe-circling level-5 ring fills everything south, including row 0', () =
   assert.equal(stateAt(states, 0, 0), MASK_WATER);
 });
 
+test('pole seam never cuts through a bay when vertex 0 sits on a multiply-crossed meridian', () => {
+  // Vertex 0's meridian (lon 5) crosses this ring's coast three times: the
+  // ring dips into a bay (lat -55 to -70) east of lon -3. A seam dropped from
+  // vertex 0 would flip the ocean between it and the bay's west wall to land.
+  const states = rasterizeMask(
+    [
+      polygon(5, [
+        [5, -50], [10, -50], [10, -55], [-3, -55], [-3, -70],
+        [90, -70], [180, -70], [-90, -70], [-5, -70], [-5, -50],
+      ]),
+    ],
+    { width: 360, height: 180 },
+  );
+  const at = (lat, lon) => states[Math.floor(lat + 90) * 360 + Math.floor(lon + 180)];
+  assert.equal(at(-59.5, 0.5), MASK_WATER); // bay, just east of the old seam
+  assert.equal(at(-59.5, 5.5), MASK_WATER);
+  assert.equal(at(-80.5, 0.5), MASK_LAND); // cap south of the ice front
+});
+
 test('sub-cell polygon marks its cell coastal only, never land', () => {
   const states = rasterize([
     polygon(1, [[1, 1], [2, 1], [2, 2], [1, 2]]),

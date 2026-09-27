@@ -101,3 +101,10 @@ test('maskStateAt handles the poles, the dateline column, and out-of-range longi
   assert.equal(maskStateAt(mask, -89.9, 180.1), MASK_LAND);
   assert.equal(maskStateAt(mask, -89.9, -539.9), MASK_LAND); // -539.9 ≡ -179.9
 });
+
+test('maskStateAt reads non-finite coordinates as coastal, never as water', () => {
+  const mask = decodeMaskBuffer(buildMaskFileBuffer(new Uint8Array(16), 4, 4));
+  for (const [lat, lon] of [[NaN, 0], [0, NaN], [Infinity, 0], [0, -Infinity]]) {
+    assert.equal(maskStateAt(mask, lat, lon), MASK_COASTAL, `(${lat}, ${lon})`);
+  }
+});

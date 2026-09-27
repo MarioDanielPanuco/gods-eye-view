@@ -28,8 +28,8 @@ export {
   maskStateAt,
 } from './landSeaMaskCodec.js';
 
-// Vite rewrites this to the emitted, content-hashed asset URL
-// (assetsInclude: ['**/*.bin']).
+// Vite rewrites this `new URL(..., import.meta.url)` form to the emitted,
+// content-hashed asset URL.
 const MASK_URL = new URL(
   './local_data/gshhg_mask/land-sea-mask.bin',
   import.meta.url,
