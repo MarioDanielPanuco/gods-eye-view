@@ -108,3 +108,24 @@ test('maskStateAt reads non-finite coordinates as coastal, never as water', () =
     assert.equal(maskStateAt(mask, lat, lon), MASK_COASTAL, `(${lat}, ${lon})`);
   }
 });
+
+test('maskStateAt accepts ±90 as boundary rows but fails closed on finite off-globe latitudes', () => {
+  // Every cell is LAND, so any read that reaches the grid returns MASK_LAND;
+  // a MASK_COASTAL result can only come from the guard, not from the data.
+  const width = 4;
+  const height = 4;
+  const states = new Uint8Array(width * height).fill(MASK_LAND);
+  const mask = decodeMaskBuffer(buildMaskFileBuffer(states, width, height));
+
+  // Exactly ±90 are valid WGS84 boundary cases: +90 clamps into the top row,
+  // -90 is the first row's own lower edge.
+  assert.equal(maskStateAt(mask, 90, 0), MASK_LAND);
+  assert.equal(maskStateAt(mask, -90, 0), MASK_LAND);
+
+  // Finite but not a geographic position: never a confident polar answer.
+  for (const lat of [90.00001, -90.00001, 91, -91, 100, -100, 1000, -1e6, Number.MAX_VALUE]) {
+    assert.equal(maskStateAt(mask, lat, 0), MASK_COASTAL, `lat ${lat}`);
+  }
+  // Longitude stays intentionally wrapped — only latitude is range-gated.
+  assert.equal(maskStateAt(mask, 0, 1000), MASK_LAND);
+});
