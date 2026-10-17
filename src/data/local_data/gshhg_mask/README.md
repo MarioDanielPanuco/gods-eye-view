@@ -14,8 +14,10 @@ High-resolution Geography), intermediate resolution `gshhs_i.b` extracted from
 (SOEST Hawaii, fetched 2026-08-29).
 `gshhs_i.b` SHA-256: `7d44bf4e16efe6056ff9d147ac0af189bbf0c16a31608426ef63ff8a91c418db`
 
-**License:** LGPL-3.0 (Wessel & Smith, GSHHG — see DATA_SOURCES.md for the
-credit line).
+**License:** LGPL-3.0-or-later (Wessel & Smith, GSHHG — see DATA_SOURCES.md
+for the credit line). `LICENSE.TXT` and `COPYING.LESSERv3` in this
+folder are GSHHG's copyright and permission notice and the LGPL text it refers
+to, copied unchanged from the same archive.
 
 **Level semantics** (GSHHG hierarchy → fill parity): L1 continents/islands →
 land, L2 lakes → water (Great Lakes NDBC buoys stay clickable), L3

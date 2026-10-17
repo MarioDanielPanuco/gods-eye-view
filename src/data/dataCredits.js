@@ -392,7 +392,7 @@ export const DATA_CREDITS = [
     html:
       'Land/sea mask: ' +
       '<a href="https://www.soest.hawaii.edu/pwessel/gshhg/" target="_blank" rel="noopener">Wessel &amp; Smith, GSHHG</a> ' +
-      '(LGPL)',
+      '(LGPL-3.0-or-later)',
   },
   {
     key: 'firms',

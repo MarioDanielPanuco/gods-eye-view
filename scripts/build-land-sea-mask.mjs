@@ -8,7 +8,7 @@
  *          https://www.soest.hawaii.edu/pwessel/gshhg/gshhg-bin-2.3.7.zip
  *          (SOEST Hawaii). Not auto-downloaded: pass the extracted file's path
  *          and record its SHA-256 in src/data/local_data/gshhg_mask/README.md.
- * License: LGPL-3.0 — credited as "Wessel & Smith, GSHHG" (see DATA_SOURCES.md).
+ * License: LGPL-3.0-or-later — credited as "Wessel & Smith, GSHHG" (see DATA_SOURCES.md).
  *
  * Transform (deterministic):
  *   1. Parse the native .b stream (src/data/gshhg/parseGshhg.js): level 6

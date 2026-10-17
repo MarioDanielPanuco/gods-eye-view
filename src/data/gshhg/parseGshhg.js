@@ -8,7 +8,7 @@
 // `river = (flag >> 25) & 1`; then n big-endian (lon, lat) int32
 // micro-degree pairs in the -180/+180 range.
 // Source: GSHHG v2.3.7 README, SOEST Hawaii (soest.hawaii.edu/pwessel/gshhg/),
-// transcribed 2026-08-29. Data license: LGPL-3.0 (Wessel & Smith, GSHHG).
+// transcribed 2026-08-29. Data license: LGPL-3.0-or-later (Wessel & Smith, GSHHG).
 //
 // Zero dependencies by design: the mask build script must run on a bare
 // `node scripts/...` with only the downloaded gshhs_i.b file.

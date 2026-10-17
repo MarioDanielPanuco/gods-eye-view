@@ -198,7 +198,7 @@ The [Bhote Koshi event pack](public/events/bhote-koshi-2026/README.md), under `p
 | **US Census Bureau counties** (3,235 county polygons)                       | `us_census_counties/`             | **Public domain**                                                                                         | ✅ (no restrictions)                             | "U.S. Census Bureau" (courtesy — not legally required)                      |
 | **CCTV ground heights** (3,445 cameras)                                     | `cctv_ground_heights/`            | Precomputed camera placement heights, aligned to work with Google Photorealistic 3D Tiles (folder README) | —                                                | —                                                                           |
 | **CCTV Camera Database** model-enrichment extract v2.26.0 (17 camera-model records) | `src/layers/cctv/modelSpecs.js` | **CC0-1.0** (public domain dedication) | ✅ (no restrictions) | "Specs: cctv-database.com" (courtesy — not legally required) |
-| **GSHHG land/sea mask** (global 1/8° three-state raster, 1.04 MB)           | `gshhg_mask/`                     | **LGPL-3.0** (derived work; regeneration script committed)                                                | ✅ (attribution + LGPL terms on the data)        | "Wessel & Smith, GSHHG"                                                     |
+| **GSHHG land/sea mask** (global 1/8° three-state raster, 1.04 MB)           | `gshhg_mask/`                     | **LGPL-3.0-or-later** (derived work; GSHHG notice and licence texts ship beside it; regeneration script committed) | ✅ (attribution + LGPL terms on the data)        | "Wessel & Smith, GSHHG"                                                     |
 
 ### ⚠️ TeleGeography is bundled but NonCommercial
 
@@ -281,9 +281,13 @@ L3 islands-in-lakes land, L4 ponds water, L5 Antarctic ice front land, L6
 grounding line skipped. Regeneration is deterministic and committed:
 `node scripts/build-land-sea-mask.mjs path/to/gshhs_i.b`.
 
-GSHHG is distributed under the **LGPL**; this raster is a derived work of the
-data and keeps that license (see the carve-out in [LICENSE](LICENSE)). Credit:
-"Wessel & Smith, GSHHG", registered in `dataCredits.js`.
+GSHHG is distributed under the **LGPL, version 3 or later**; this raster is a
+derived work of the data and keeps that license (see the carve-out in
+[LICENSE](LICENSE)). GSHHG's own `LICENSE.TXT` asks that its copyright and
+permission notice appear in all copies, so that file and the `COPYING.LESSERv3`
+text it refers to are committed in `gshhg_mask/` unchanged (the binary archive
+ships no `COPYINGv3`; the LGPL incorporates the GPL by reference).
+Credit: "Wessel & Smith, GSHHG", registered in `dataCredits.js`.
 
 ### DataSF Analysis Neighborhoods (`neighborhoods/`)
 
