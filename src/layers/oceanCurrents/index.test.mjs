@@ -1,15 +1,31 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createOceanCurrentsLayer, boxChanged, viewBox } from './index.js';
+import {
+  createOceanCurrentsLayer,
+  boxChanged,
+  viewBox,
+  viewSpanKm,
+  viewTier,
+} from './index.js';
 
 const snapshot = (tier = 'regional') => ({
   field: 'ocean-currents',
   tier,
-  cycle: { validIso: '2026-10-16T06:00:00.000Z', runIso: null, forecastHour: null },
+  cycle: {
+    validIso: '2026-10-16T06:00:00.000Z',
+    runIso: null,
+    forecastHour: null,
+  },
   grid: { nx: 2, ny: 2, lo1: -75, la1: 39, dx: 5, dy: 5 },
   bbox: { latMin: 34, latMax: 39, lonMin: -75, lonMax: -70 },
   noData: -9999,
-  speed: { medianMs: 0.3, p95Ms: 0.6, maxMs: 1.2, validCells: 4, totalCells: 4 },
+  speed: {
+    medianMs: 0.3,
+    p95Ms: 0.6,
+    maxMs: 1.2,
+    validCells: 4,
+    totalCells: 4,
+  },
   provenance: {
     tier: 'composite',
     tierLabel: 'HF radar over global surface currents',
@@ -30,12 +46,22 @@ const snapshot = (tier = 'regional') => ({
 const rad = Math.PI / 180;
 const cesium = { Ellipsoid: { WGS84: {} } };
 
-function harness(feed, { rectangle = null, retryMs = 60_000 } = {}) {
+function harness(
+  feed,
+  { rectangle = null, retryMs = 60_000, debounceMs = 0 } = {},
+) {
   const calls = [];
   const rendering = Object.fromEntries(
-    ['attach', 'start', 'stop', 'clear', 'destroy', 'setField', 'setOptions', 'rehome'].map(
-      (name) => [name, (...args) => calls.push([name, ...args])],
-    ),
+    [
+      'attach',
+      'start',
+      'stop',
+      'clear',
+      'destroy',
+      'setField',
+      'setOptions',
+      'rehome',
+    ].map((name) => [name, (...args) => calls.push([name, ...args])]),
   );
   const gpu = { ready: true, pathCount: 10 };
   rendering.getDiagnostics = () => ({ renderMode: 'gpu-streamlines', gpu });
@@ -53,7 +79,7 @@ function harness(feed, { rectangle = null, retryMs = 60_000 } = {}) {
   };
   const layer = createOceanCurrentsLayer({
     feed,
-    debounceMs: 0,
+    debounceMs,
     retryMs,
     cesium,
     createRendering: (options) => {
@@ -84,7 +110,10 @@ test('box helpers: camera rectangle to degrees and the quarter-degree change gat
   );
   assert.deepEqual(box, { latMin: 34, latMax: 39, lonMin: -75, lonMax: -70 });
   assert.equal(
-    viewBox({ scene: { camera: { computeViewRectangle: () => undefined } } }, cesium),
+    viewBox(
+      { scene: { camera: { computeViewRectangle: () => undefined } } },
+      cesium,
+    ),
     null,
   );
   assert.equal(boxChanged(box, { ...box, lonMax: -69.8 }), false);
@@ -95,7 +124,12 @@ test('box helpers: camera rectangle to degrees and the quarter-degree change gat
 
 test('update sends the camera box, installs the field with the ocean spec and a moveEnd refetches on a changed box', async () => {
   const requests = [];
-  let rectangle = { west: -75 * rad, east: -70 * rad, south: 34 * rad, north: 39 * rad };
+  let rectangle = {
+    west: -75 * rad,
+    east: -70 * rad,
+    south: 34 * rad,
+    north: 39 * rad,
+  };
   const h = harness({
     getSnapshot: async (args) => {
       requests.push(args.box);
@@ -105,8 +139,16 @@ test('update sends the camera box, installs the field with the ocean spec and a 
   h.viewer.scene.camera.computeViewRectangle = () => rectangle;
   assert.equal(h.spec().calmCutoffMs, 0.02);
   await h.layer.update(h.viewer);
-  assert.deepEqual(requests[0], { latMin: 34, latMax: 39, lonMin: -75, lonMax: -70 });
-  assert.equal(h.calls.find(([name]) => name === 'setField')[1].tier, 'regional');
+  assert.deepEqual(requests[0], {
+    latMin: 34,
+    latMax: 39,
+    lonMin: -75,
+    lonMax: -70,
+  });
+  assert.equal(
+    h.calls.find(([name]) => name === 'setField')[1].tier,
+    'regional',
+  );
   for (const fn of h.moveEnd.listeners) fn();
   await new Promise((resolve) => setTimeout(resolve, 5));
   assert.equal(requests.length, 1, 'unchanged box: no refetch');
@@ -124,7 +166,10 @@ test('update sends the camera box, installs the field with the ocean spec and a 
   assert.ok(controls.chips.some((chip) => chip.id === 'motion'));
   assert.equal(controls.legend.length, 5);
   assert.equal(h.layer.getStats().count, 4);
-  assert.equal(h.layer.getStats().source, 'HF radar over global surface currents');
+  assert.equal(
+    h.layer.getStats().source,
+    'HF radar over global surface currents',
+  );
   h.layer.destroy();
   assert.equal(h.moveEnd.listeners.size, 0);
 });
@@ -135,7 +180,9 @@ test('disable aborts in-flight work and clears; unavailable snapshots stop rende
     getSnapshot: (args) => {
       signal = args.signal;
       return new Promise((resolve) =>
-        signal.addEventListener('abort', () => resolve(snapshot()), { once: true }),
+        signal.addEventListener('abort', () => resolve(snapshot()), {
+          once: true,
+        }),
       );
     },
   });
@@ -163,7 +210,10 @@ test('disable aborts in-flight work and clears; unavailable snapshots stop rende
   await u.layer.update(u.viewer);
   assert.ok(u.calls.some(([name]) => name === 'clear'));
   assert.equal(u.layer.getStats().error, 'Ocean current upstream unavailable');
-  assert.equal(u.layer.getRowControls().summary.status, 'Ocean current upstream unavailable');
+  assert.equal(
+    u.layer.getRowControls().summary.status,
+    'Ocean current upstream unavailable',
+  );
   await new Promise((resolve) => setTimeout(resolve, 40));
   assert.equal(attempts, 2, 'an unavailable answer retries after retryMs');
   assert.equal(u.layer.getStats().error, null);
@@ -176,7 +226,11 @@ test('an update superseded by a newer one resolves with the newer result instead
     getSnapshot: (args) =>
       new Promise((resolve, reject) => {
         pending.push({ args, resolve });
-        args.signal.addEventListener('abort', () => reject(args.signal.reason), { once: true });
+        args.signal.addEventListener(
+          'abort',
+          () => reject(args.signal.reason),
+          { once: true },
+        );
       }),
   });
   // The manager's enable-time update is in flight when a camera move lands.
@@ -186,10 +240,18 @@ test('an update superseded by a newer one resolves with the newer result instead
   const moveCall = h.layer.update(h.viewer);
   await Promise.resolve();
   assert.equal(pending.length, 2);
-  assert.equal(pending[0].args.signal.aborted, true, 'the older request is cancelled');
+  assert.equal(
+    pending[0].args.signal.aborted,
+    true,
+    'the older request is cancelled',
+  );
   pending[1].resolve(snapshot('regional'));
   assert.equal(await moveCall, true);
-  assert.equal(await managerCall, true, 'the manager sees the field that replaced its request');
+  assert.equal(
+    await managerCall,
+    true,
+    'the manager sees the field that replaced its request',
+  );
   assert.equal(h.layer.getStats().tier, 'regional');
   // An external abort still reports cancellation.
   const external = new AbortController();
@@ -223,4 +285,119 @@ test('diagnostics carry the update timing: fetch, build, ready and total', async
   assert.equal(after.readyMs, 60);
   assert.ok(after.totalMs >= after.fetchMs + 60, `total ${after.totalMs}`);
   assert.ok(after.totalMs < after.fetchMs + 60 + 1000);
+});
+
+test('viewSpanKm mirrors the server boxSpanKm (server/ocean/fieldGrid.js) to the metre', () => {
+  // Reference values printed by the server function on 2026-10-17.
+  const cases = [
+    [{ latMin: 34, latMax: 39, lonMin: -75, lonMax: -70 }, 554.8414796644629],
+    [{ latMin: 65, latMax: 75, lonMin: 0, lonMax: 10 }, 1115.6202510275596],
+    // Eastward longitude span: 175 -> -175 is 10 deg, not 350.
+    [
+      { latMin: -10, latMax: 10, lonMin: 175, lonMax: -175 },
+      2211.4855164318865,
+    ],
+    [{ latMin: -60, latMax: 60, lonMin: -120, lonMax: 40 }, 17811.118526923772],
+  ];
+  for (const [box, maxKm] of cases)
+    assert.ok(
+      Math.abs(viewSpanKm(box) - maxKm) < 1e-6,
+      `${JSON.stringify(box)} -> ${viewSpanKm(box)}`,
+    );
+  assert.equal(viewSpanKm(null), null);
+  assert.equal(
+    viewSpanKm({ latMin: 0, latMax: Number.NaN, lonMin: 0, lonMax: 1 }),
+    null,
+  );
+});
+
+test('viewTier mirrors the server thresholds: 5000 km global, 800 km HF radar composite', () => {
+  // GLOBAL_SPAN_KM in server/providers/oceanCurrents.js, HFR_MAX_SPAN_KM in
+  // server/ocean/fieldGrid.js; both compare on the larger ground span.
+  const atLat0 = (lonDeg) => ({
+    latMin: -1,
+    latMax: 1,
+    lonMin: 0,
+    lonMax: lonDeg,
+  });
+  assert.equal(
+    viewTier({ latMin: -60, latMax: 60, lonMin: -120, lonMax: 40 }),
+    'global',
+  );
+  assert.equal(viewTier(atLat0(50)), 'global'); // 5566 km
+  assert.equal(viewTier(atLat0(44)), 'regional'); // 4898 km
+  assert.equal(viewTier(atLat0(8)), 'regional'); // 891 km
+  assert.equal(viewTier(atLat0(7)), 'coastal'); // 779 km
+  assert.equal(viewTier(null), null);
+});
+
+test('a moveEnd that crosses a tier updates at once; a pan inside a tier keeps the debounce', async () => {
+  const requests = [];
+  let rectangle = {
+    west: -120 * rad,
+    east: 40 * rad,
+    south: -60 * rad,
+    north: 60 * rad,
+  };
+  const h = harness(
+    {
+      getSnapshot: async (args) => {
+        requests.push(args.box);
+        return snapshot(
+          viewTier(args.box) === 'global' ? 'global' : 'regional',
+        );
+      },
+    },
+    { debounceMs: 80 },
+  );
+  h.viewer.scene.camera.computeViewRectangle = () => rectangle;
+  await h.layer.update(h.viewer);
+  assert.equal(requests.length, 1);
+  const fire = () => {
+    for (const fn of h.moveEnd.listeners) fn();
+  };
+  // Globe -> regional (20 deg, about 2200 km): the request leaves before
+  // the debounce elapses.
+  rectangle = {
+    west: -80 * rad,
+    east: -60 * rad,
+    south: 25 * rad,
+    north: 45 * rad,
+  };
+  fire();
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(requests.length, 2, 'tier crossing skips the debounce');
+  assert.deepEqual(requests[1], {
+    latMin: 25,
+    latMax: 45,
+    lonMin: -80,
+    lonMax: -60,
+  });
+  // Same tier, box moved: nothing until the debounce elapses.
+  rectangle = {
+    west: -79 * rad,
+    east: -59 * rad,
+    south: 25 * rad,
+    north: 45 * rad,
+  };
+  fire();
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(requests.length, 2, 'same tier waits for the debounce');
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(requests.length, 3);
+  // Regional -> coastal crosses again; a second moveEnd in the same tier
+  // and the same box asks for nothing.
+  rectangle = {
+    west: -122.6 * rad,
+    east: -121.6 * rad,
+    south: 36.2 * rad,
+    north: 37.3 * rad,
+  };
+  fire();
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(requests.length, 4, 'regional to coastal skips the debounce');
+  fire();
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(requests.length, 4, 'unchanged box: no request');
+  h.layer.destroy();
 });
