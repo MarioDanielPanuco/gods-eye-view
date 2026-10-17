@@ -412,7 +412,12 @@ export const DATA_CREDITS = [
     html:
       'Nearshore surface currents: ' +
       '<a href="https://hfradar.ndbc.noaa.gov/" target="_blank" rel="noopener">IOOS HF-radar national network</a> ' +
-      'via NOAA CoastWatch ERDDAP (U.S. public domain)',
+      // ERDDAP's licence attribute on the ucsdHfr* datasets is the same
+      // free-use, no-warranty, not-for-legal-use statement CoastWatch's
+      // blended currents carry (DATA_SOURCES.md quotes it), not a
+      // public-domain dedication.
+      'via NOAA CoastWatch ERDDAP (free to use and redistribute, not for ' +
+      'legal use, no warranty)',
   },
   // ── Bundled snapshots ───────────────────────────────────────────
   {
