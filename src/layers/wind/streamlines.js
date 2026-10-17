@@ -79,13 +79,15 @@ function seedPoint(seed, budget, bbox) {
  * Equal-area seeds avoid polar overpopulation. Increasing path position always
  * follows the wind; paths stop at the map seam, poles, calm or missing samples.
  * A field with a `bbox` is seeded equal-area inside that box instead of the
- * whole sphere; `calmCutoffMs` and `maxStepDegrees` default to the wind
+ * whole sphere; `maxCount` raises the seed ceiling above WIND_PATH_LIMIT for
+ * sparse fields (ocean globe); `calmCutoffMs` and `maxStepDegrees` default to the wind
  * constants (0.15 m/s, 0.75 deg for a global grid).
  */
 export function bakeWindStreamlines(
   field,
   {
     count = WIND_PATH_LIMIT,
+    maxCount = WIND_PATH_LIMIT,
     steps = WIND_PATH_STEPS,
     stepSeconds = 1800,
     calmCutoffMs = 0.15,
@@ -103,8 +105,14 @@ export function bakeWindStreamlines(
     !field.v
   )
     return [];
-  const budget = Math.min(
+  // The ceiling is the caller's: a field spec may seed a sparse field past
+  // the wind limit, but never below it.
+  const ceiling = Math.max(
     WIND_PATH_LIMIT,
+    Number.isFinite(maxCount) ? Math.floor(maxCount) : WIND_PATH_LIMIT,
+  );
+  const budget = Math.min(
+    ceiling,
     Math.max(0, Math.floor(Number.isFinite(count) ? count : WIND_PATH_LIMIT)),
   );
   const halfSteps = Math.min(
@@ -158,6 +166,29 @@ export function bakeWindStreamlines(
     });
   }
   return paths;
+}
+
+/**
+ * Summed path length in degrees (longitude scaled by cos latitude, no
+ * great-circle correction) divided by the span in degrees: the line
+ * coverage the seed budget targets. 0 for an empty set or a zero span.
+ */
+export function measureLineCoverage(paths, spanDeg) {
+  if (!(spanDeg > 0)) return 0;
+  const degree = Math.PI / 180;
+  let total = 0;
+  for (const path of paths) {
+    const points = path.coordinates;
+    for (let i = 1; i < points.length; i++) {
+      const [lon0, lat0] = points[i - 1];
+      const [lon1, lat1] = points[i];
+      const dlon =
+        normalizeLongitude(lon1 - lon0) *
+        Math.cos(((lat0 + lat1) / 2) * degree);
+      total += Math.hypot(dlon, lat1 - lat0);
+    }
+  }
+  return total / spanDeg;
 }
 
 /** Group baked paths by their middle coordinate, preserving path and cell order. */

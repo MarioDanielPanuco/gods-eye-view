@@ -1,5 +1,6 @@
 import {
   bakeWindStreamlines,
+  measureLineCoverage,
   groupWindPaths,
   WIND_PATH_LIMIT,
   WIND_NARROW_PATH_LIMIT,
@@ -9,6 +10,8 @@ import {
   fieldRampMax,
   fieldSpeedScale,
   rampStopVectors,
+  isGlobeField,
+  fieldSeedBudget,
 } from './fieldSpec.js';
 
 export const WIND_FADE_LOW_METERS = 15000;
@@ -117,16 +120,47 @@ export function createWindGpuRendering({
     const started = globalThis.performance?.now?.() ?? Date.now();
     try {
       const width = getViewer().scene.canvas?.clientWidth;
-      const budget =
+      const baseBudget =
         width > 0 && width < 700 ? WIND_NARROW_PATH_LIMIT : WIND_PATH_LIMIT;
+      const budget = fieldSeedBudget(spec, field, baseBudget);
       const speedScale = fieldSpeedScale(spec, field);
       const stepSeconds = 1800 * speedScale;
       const rampMax = fieldRampMax(spec, field);
-      const paths = bakeWindStreamlines(field, {
-        count: budget,
-        stepSeconds,
-        calmCutoffMs: spec.calmCutoffMs,
-      });
+      const globe = isGlobeField(field);
+      const seedSpan = globe
+        ? 360
+        : (((field.bbox.lonMax - field.bbox.lonMin) % 360) + 360) % 360 || 360;
+      const bake = (count) =>
+        bakeWindStreamlines(field, {
+          count,
+          maxCount: count,
+          stepSeconds,
+          calmCutoffMs: spec.calmCutoffMs,
+        });
+      let seeds = budget;
+      let paths = bake(seeds);
+      let coverage = measureLineCoverage(paths, seedSpan);
+      // The box budget assumes median-length paths; coasts and no-data cut
+      // them short. One correction pass rescales the seed count by the
+      // shortfall, still bounded by the base budget.
+      const target = spec.boxLineCoverage;
+      if (
+        !globe &&
+        Number.isFinite(target) &&
+        target > 0 &&
+        coverage > 0 &&
+        coverage < 0.9 * target
+      ) {
+        const corrected = Math.min(
+          baseBudget,
+          Math.round((seeds * target) / coverage),
+        );
+        if (corrected > seeds) {
+          seeds = corrected;
+          paths = bake(seeds);
+          coverage = measureLineCoverage(paths, seedSpan);
+        }
+      }
       if (!paths.length) return false;
       let vertexCount = 0;
       const stops = rampStopVectors(spec.ramp);
@@ -245,6 +279,8 @@ export function createWindGpuRendering({
         error: null,
         speedScale,
         stepSeconds,
+        seedCount: seeds,
+        lineCoverage: coverage,
       };
       return true;
     } catch (error) {

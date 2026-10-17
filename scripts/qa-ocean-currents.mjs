@@ -206,7 +206,7 @@ try {
         !state.stats.error &&
         state.stats.tier === stop.tier &&
         drawn > 0,
-      `mode=${state?.diagnostics?.renderMode} paths=${state?.diagnostics?.gpu?.pathCount ?? state?.diagnostics?.particleCount} speedScale=${state?.diagnostics?.speedScale ?? state?.diagnostics?.gpu?.speedScale} tier=${state?.stats?.tier} error=${state?.stats?.error ?? 'none'}`,
+      `mode=${state?.diagnostics?.renderMode} paths=${state?.diagnostics?.gpu?.pathCount ?? state?.diagnostics?.particleCount} seeds=${state?.diagnostics?.gpu?.seedCount} coverage=${state?.diagnostics?.gpu?.lineCoverage?.toFixed?.(1)} speedScale=${state?.diagnostics?.speedScale ?? state?.diagnostics?.gpu?.speedScale} tier=${state?.stats?.tier} error=${state?.stats?.error ?? 'none'}`,
     );
     await sleep(HOLD_MS);
     await page.screenshot({ path: path.join(OUT, `${stop.name}.png`) });

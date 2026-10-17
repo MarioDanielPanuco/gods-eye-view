@@ -471,7 +471,9 @@ test('ocean spec scales the step by (E1), colours paths by speed and seeds insid
   assert.deepEqual([stop4.x, stop4.y, stop4.z], stops[4]);
   assert.equal(batch.appearance.material.uniforms.rampGamma, 0.55);
   for (const instance of batches.flatMap((p) => p.geometryInstances)) {
-    assert.ok(Math.abs(instance.attributes.fieldSpeed.value[0] - 0.4 / 1) < 1e-6);
+    assert.ok(
+      Math.abs(instance.attributes.fieldSpeed.value[0] - 0.4 / 1) < 1e-6,
+    );
     for (const position of instance.geometry.positions) {
       const carto = Ellipsoid.WGS84.cartesianToCartographic(position);
       const lon = (carto.longitude * 180) / Math.PI;
@@ -525,5 +527,143 @@ test('display height and height-fade thresholds come from the field spec', async
   const camera = { ...h.scene.camera, positionCartographic: { height: 1000 } };
   owner.updateVisibility(camera);
   assert.ok(Math.abs(owner.getDiagnostics().heightFade - 700 / 900) < 1e-9);
+  owner.destroy();
+});
+
+test('ocean spec seeds the globe at globeSeedScale times the wind budget', async () => {
+  const { OCEAN_FIELD_SPEC } = await import('./fieldSpec.js');
+  const h = harness();
+  const owner = createWindGpuRendering({
+    cesium: h.C,
+    getViewer: () => ({ scene: h.scene }),
+    spec: OCEAN_FIELD_SPEC,
+  });
+  // The served global manifest carries the lattice extent as its bbox.
+  const globe = {
+    ...field(),
+    periodic: true,
+    bbox: { latMin: -90, latMax: 90, lonMin: -180, lonMax: 180 },
+    speed: { medianMs: 0.2, p95Ms: 0.5 },
+  };
+  assert.equal(owner.setField(globe), true);
+  const pathCount = owner.getDiagnostics().pathCount;
+  assert.ok(
+    pathCount > 7200,
+    `globe seeds past the wind limit, got ${pathCount}`,
+  );
+  assert.ok(
+    pathCount <= 14400,
+    `globe seeds bounded by 2 x 7200, got ${pathCount}`,
+  );
+  assert.ok(
+    pathCount > 14000,
+    `dense field keeps nearly every seed, got ${pathCount}`,
+  );
+  owner.destroy();
+});
+
+test('ocean spec seeds a box from its line coverage and reports the realized coverage', async () => {
+  const { OCEAN_FIELD_SPEC, fieldSeedBudget } = await import('./fieldSpec.js');
+  const h = harness();
+  const owner = createWindGpuRendering({
+    cesium: h.C,
+    getViewer: () => ({ scene: h.scene }),
+    spec: OCEAN_FIELD_SPEC,
+  });
+  const ocean = {
+    nx: 97,
+    ny: 81,
+    lo1: -82,
+    la1: 45,
+    dx: 0.25,
+    dy: 0.25,
+    u: new Float32Array(97 * 81).fill(0.4),
+    v: new Float32Array(97 * 81),
+    periodic: false,
+    noData: -9999,
+    bbox: { latMin: 25, latMax: 45, lonMin: -82, lonMax: -58 },
+    speed: { medianMs: 0.4, p95Ms: 0.8, validCells: 7857, totalCells: 7857 },
+  };
+  assert.equal(owner.setField(ocean), true);
+  const d = owner.getDiagnostics();
+  const seeds = fieldSeedBudget(OCEAN_FIELD_SPEC, ocean, 7200);
+  assert.equal(d.seedCount, seeds);
+  assert.ok(
+    seeds < 1000,
+    `coverage budget is far below the wind limit, got ${seeds}`,
+  );
+  assert.ok(
+    d.pathCount > seeds * 0.8 && d.pathCount <= seeds,
+    `uniform field keeps nearly every seed, got ${d.pathCount}`,
+  );
+  // Uniform 0.4 m/s: every step is 0.4 x 1800 x (5.836 / 0.4) m = 0.0945 deg,
+  // 32 steps per path over a 24 deg span; paths seeded near the east and
+  // west edges stop at the edge, so the realized coverage falls a few
+  // percent short of the full-length estimate.
+  const perPath = (32 * (0.4 * 1800 * (5.836 / 0.4))) / 111195;
+  const full = (d.pathCount * perPath) / 24;
+  assert.ok(
+    d.lineCoverage > 0.9 * full && d.lineCoverage <= full + 1e-9,
+    `lineCoverage ${d.lineCoverage} vs full-length ${full}`,
+  );
+  owner.destroy();
+});
+
+test('a box whose paths stop early is reseeded until it holds the spec coverage', async () => {
+  const { OCEAN_FIELD_SPEC, fieldSeedBudget } = await import('./fieldSpec.js');
+  const h = harness();
+  const owner = createWindGpuRendering({
+    cesium: h.C,
+    getViewer: () => ({ scene: h.scene }),
+    spec: OCEAN_FIELD_SPEC,
+  });
+  // Northward flow with a no-data row every other degree: every path ends
+  // within a degree of its seed, a third of the median path length the
+  // budget assumes, so the first pass lands well under the coverage.
+  const nx = 97;
+  const ny = 81;
+  const u = new Float32Array(nx * ny);
+  const v = new Float32Array(nx * ny).fill(0.4);
+  let valid = 0;
+  for (let row = 0; row < ny; row++) {
+    const noData = Math.floor(row / 4) % 2 === 1;
+    for (let col = 0; col < nx; col++) {
+      if (noData) {
+        u[row * nx + col] = -9999;
+        v[row * nx + col] = -9999;
+      } else valid++;
+    }
+  }
+  const ocean = {
+    nx,
+    ny,
+    lo1: -82,
+    la1: 45,
+    dx: 0.25,
+    dy: 0.25,
+    u,
+    v,
+    periodic: false,
+    noData: -9999,
+    bbox: { latMin: 25, latMax: 45, lonMin: -82, lonMax: -58 },
+    speed: {
+      medianMs: 0.4,
+      p95Ms: 0.8,
+      validCells: valid,
+      totalCells: nx * ny,
+    },
+  };
+  assert.equal(owner.setField(ocean), true);
+  const d = owner.getDiagnostics();
+  const firstPass = fieldSeedBudget(OCEAN_FIELD_SPEC, ocean, 7200);
+  assert.ok(
+    d.seedCount > firstPass,
+    `reseeded past ${firstPass}, got ${d.seedCount}`,
+  );
+  assert.ok(d.seedCount <= 7200);
+  assert.ok(
+    d.lineCoverage >= 0.85 * OCEAN_FIELD_SPEC.boxLineCoverage,
+    `coverage ${d.lineCoverage} vs target ${OCEAN_FIELD_SPEC.boxLineCoverage}`,
+  );
   owner.destroy();
 });
