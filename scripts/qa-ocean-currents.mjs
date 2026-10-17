@@ -18,7 +18,11 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const OUT = path.join(path.resolve(__dirname, '..'), 'qa-shots', 'ocean-currents');
+const OUT = path.join(
+  path.resolve(__dirname, '..'),
+  'qa-shots',
+  'ocean-currents',
+);
 const argv = process.argv.slice(2);
 const getOpt = (name, dflt) => {
   const i = argv.indexOf(name);
@@ -27,6 +31,15 @@ const getOpt = (name, dflt) => {
 const APP_URL = getOpt('--url', 'http://localhost:4420');
 const HOLD_MS = Number(getOpt('--hold', '6000'));
 const VIDEO = !argv.includes('--no-video');
+// Optional per-stop budgets (ms) for the layer's update timing; unset means
+// report only. buildMs is the main-thread block in setField (bake + geometry
+// instances); totalMs runs from the update's entry to the first frame whose
+// Cesium geometry is ready, debounce excluded. Headless swiftshader inflates
+// the GPU-side phases, so compare runs on one machine.
+const BUDGET_BUILD_MS = Number(getOpt('--budget-build-ms', 'NaN'));
+const BUDGET_TOTAL_MS = Number(getOpt('--budget-total-ms', 'NaN'));
+const ms = (value) =>
+  Number.isFinite(value) ? `${value.toFixed(0)}ms` : 'n/a';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // lon, lat, camera height (m), the box the status probe asks for, expected tier.
@@ -177,7 +190,8 @@ try {
   for (const stop of STOPS) {
     await setView(page, stop.lon, stop.lat, stop.height);
     await page.evaluate(() => {
-      const entry = window.__godsEyeView.dataManager.layers.get('ocean-currents');
+      const entry =
+        window.__godsEyeView.dataManager.layers.get('ocean-currents');
       return entry?.module?.update?.(window.__godsEyeView.viewer);
     });
     const state = await waitForField(page);
@@ -198,7 +212,9 @@ try {
       `validCells=${status.speed?.validCells} median=${status.speed?.medianMs?.toFixed?.(3)} p95=${status.speed?.p95Ms?.toFixed?.(3)}`,
     );
     const drawn =
-      state?.diagnostics?.gpu?.pathCount ?? state?.diagnostics?.particleCount ?? 0;
+      state?.diagnostics?.gpu?.pathCount ??
+      state?.diagnostics?.particleCount ??
+      0;
     record(
       `${stop.name}: layer rendered`,
       Boolean(state?.stats) &&
@@ -207,6 +223,18 @@ try {
         state.stats.tier === stop.tier &&
         drawn > 0,
       `mode=${state?.diagnostics?.renderMode} paths=${state?.diagnostics?.gpu?.pathCount ?? state?.diagnostics?.particleCount} seeds=${state?.diagnostics?.gpu?.seedCount} coverage=${state?.diagnostics?.gpu?.lineCoverage?.toFixed?.(1)} speedScale=${state?.diagnostics?.speedScale ?? state?.diagnostics?.gpu?.speedScale} tier=${state?.stats?.tier} error=${state?.stats?.error ?? 'none'}`,
+    );
+    const timing = state?.diagnostics?.timing ?? {};
+    const underBudget = (value, budget) =>
+      !Number.isFinite(budget) || (Number.isFinite(value) && value <= budget);
+    record(
+      `${stop.name}: render timing`,
+      underBudget(timing.buildMs, BUDGET_BUILD_MS) &&
+        underBudget(timing.totalMs, BUDGET_TOTAL_MS),
+      `fetch=${ms(timing.fetchMs)} build=${ms(timing.buildMs)} ready=${ms(timing.readyMs)} total=${ms(timing.totalMs)}` +
+        (Number.isFinite(BUDGET_BUILD_MS) || Number.isFinite(BUDGET_TOTAL_MS)
+          ? ` budget build<=${ms(BUDGET_BUILD_MS)} total<=${ms(BUDGET_TOTAL_MS)}`
+          : ''),
     );
     await sleep(HOLD_MS);
     await page.screenshot({ path: path.join(OUT, `${stop.name}.png`) });
@@ -217,7 +245,11 @@ try {
 }
 fs.writeFileSync(
   path.join(OUT, 'result.json'),
-  JSON.stringify({ appUrl: APP_URL, results, at: new Date().toISOString() }, null, 2),
+  JSON.stringify(
+    { appUrl: APP_URL, results, at: new Date().toISOString() },
+    null,
+    2,
+  ),
 );
 const failed = results.filter((r) => !r.ok);
 console.log(failed.length ? `\n${failed.length} FAIL` : '\nall PASS');

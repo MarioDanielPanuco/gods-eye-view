@@ -66,6 +66,7 @@ export function createWindGpuRendering({
     pathCount: 0,
     vertexCount: 0,
     buildMs: 0,
+    readyMs: null,
     error: null,
     cellCount: 0,
     visibleCells: 0,
@@ -75,6 +76,21 @@ export function createWindGpuRendering({
     stepSeconds: 1800,
   });
   let diagnostics = emptyDiagnostics();
+  // Entry of the last setField, so readyMs shares buildMs's origin.
+  let buildStarted = 0;
+  const now = () => globalThis.performance?.now?.() ?? Date.now();
+
+  // Cesium builds the geometry on workers after the primitives are added, so
+  // "ready" lands frames after setField returns. The frame loop reads these
+  // diagnostics every frame; the first read that sees every cell ready stamps
+  // readyMs, measured from the same start as buildMs.
+  function allReady() {
+    const ready =
+      cells.length > 0 && cells.every((cell) => cell.primitive.ready);
+    if (ready && diagnostics.readyMs === null)
+      diagnostics.readyMs = now() - buildStarted;
+    return ready;
+  }
 
   function supported() {
     const scene = getViewer?.()?.scene;
@@ -117,7 +133,8 @@ export function createWindGpuRendering({
   function setField(field) {
     clear();
     if (!supported() || !field) return false;
-    const started = globalThis.performance?.now?.() ?? Date.now();
+    const started = now();
+    buildStarted = started;
     try {
       const width = getViewer().scene.canvas?.clientWidth;
       const baseBudget =
@@ -275,7 +292,7 @@ export function createWindGpuRendering({
         cellCount: cells.length,
         pathCount: paths.length,
         vertexCount,
-        buildMs: (globalThis.performance?.now?.() ?? Date.now()) - started,
+        buildMs: now() - started,
         error: null,
         speedScale,
         stepSeconds,
@@ -349,11 +366,14 @@ export function createWindGpuRendering({
       destroyed = true;
     },
     getParticleCount: () => diagnostics.pathCount,
-    getDiagnostics: () => ({
-      ...diagnostics,
-      ready: cells.length > 0 && cells.every((cell) => cell.primitive.ready),
-      mode: 'gpu-streamlines',
-      displayHeightMeters: spec.displayHeightMeters,
-    }),
+    getDiagnostics: () => {
+      const ready = allReady(); // stamps readyMs before the copy below
+      return {
+        ...diagnostics,
+        ready,
+        mode: 'gpu-streamlines',
+        displayHeightMeters: spec.displayHeightMeters,
+      };
+    },
   };
 }

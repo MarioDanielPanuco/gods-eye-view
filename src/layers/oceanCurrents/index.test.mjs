@@ -37,10 +37,8 @@ function harness(feed, { rectangle = null, retryMs = 60_000 } = {}) {
       (name) => [name, (...args) => calls.push([name, ...args])],
     ),
   );
-  rendering.getDiagnostics = () => ({
-    renderMode: 'gpu-streamlines',
-    gpu: { ready: true, pathCount: 10 },
-  });
+  const gpu = { ready: true, pathCount: 10 };
+  rendering.getDiagnostics = () => ({ renderMode: 'gpu-streamlines', gpu });
   let spec = null;
   const moveEnd = {
     listeners: new Set(),
@@ -65,7 +63,7 @@ function harness(feed, { rectangle = null, retryMs = 60_000 } = {}) {
   });
   layer.init(viewer);
   layer.enable();
-  return { layer, calls, viewer, moveEnd, spec: () => spec };
+  return { layer, calls, viewer, moveEnd, gpu, spec: () => spec };
 }
 
 test('box helpers: camera rectangle to degrees and the quarter-degree change gate', () => {
@@ -200,4 +198,29 @@ test('an update superseded by a newer one resolves with the newer result instead
   external.abort();
   assert.equal(await cancelled, false);
   h.layer.destroy();
+});
+
+test('diagnostics carry the update timing: fetch, build, ready and total', async () => {
+  const h = harness({
+    getSnapshot: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return snapshot();
+    },
+  });
+  assert.equal(h.layer.getDiagnostics().timing, null, 'nothing measured yet');
+  await h.layer.update(h.viewer);
+  const before = h.layer.getDiagnostics().timing;
+  assert.ok(before.fetchMs >= 15, `fetch waited: ${before.fetchMs}`);
+  assert.equal(before.buildMs, null, 'fake renderer reports no build');
+  assert.equal(before.readyMs, null);
+  assert.equal(before.totalMs, null, 'total waits for ready');
+  // Once the renderer reports the field built and ready, the layer sums them.
+  h.gpu.buildMs = 42;
+  h.gpu.readyMs = 60;
+  const after = h.layer.getDiagnostics().timing;
+  assert.equal(after.fetchMs, before.fetchMs);
+  assert.equal(after.buildMs, 42);
+  assert.equal(after.readyMs, 60);
+  assert.ok(after.totalMs >= after.fetchMs + 60, `total ${after.totalMs}`);
+  assert.ok(after.totalMs < after.fetchMs + 60 + 1000);
 });

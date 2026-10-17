@@ -114,6 +114,11 @@ export function createOceanCurrentsLayer({
   let paused = false;
   let overlay = 'none';
   let lastBox = null;
+  // Wall-clock phases of the last update, for the QA script and diagnostics:
+  // startedAt is the update entry, fetchMs the snapshot (manifest + .bin,
+  // cache hits included), renderedAt the setField entry; the renderer's
+  // buildMs/readyMs are measured from renderedAt.
+  let timing = null;
   let removeMoveEnd = null;
   let timer = null;
   let retry = null;
@@ -147,12 +152,31 @@ export function createOceanCurrentsLayer({
     }, retryMs);
   }
 
+  // Phases of the last update in ms. buildMs and readyMs come from the GPU
+  // renderer when the field was handed to it; totalMs spans update entry to
+  // the first frame whose geometry is ready, so the moveEnd debounce sits
+  // outside it. null until measured.
+  function updateTiming(gpu) {
+    if (!timing) return null;
+    const rendered = timing.renderedAt !== null;
+    const buildMs =
+      rendered && Number.isFinite(gpu?.buildMs) ? gpu.buildMs : null;
+    const readyMs =
+      rendered && Number.isFinite(gpu?.readyMs) ? gpu.readyMs : null;
+    const totalMs =
+      readyMs === null ? null : timing.renderedAt - timing.startedAt + readyMs;
+    return { fetchMs: timing.fetchMs, buildMs, readyMs, totalMs };
+  }
+
   let sequence = 0;
   let latestOutcome = Promise.resolve(false);
+
+  const now = () => globalThis.performance?.now?.() ?? Date.now();
 
   async function runUpdate(nextViewer, signal) {
     if (!enabled) return false;
     if (nextViewer) viewer = nextViewer;
+    const startedAt = now();
     rendering?.rehome?.();
     request?.abort();
     const controller = new AbortController();
@@ -171,6 +195,7 @@ export function createOceanCurrentsLayer({
       });
       if (!enabled || controller.signal.aborted || request !== controller)
         return false;
+      timing = { startedAt, fetchMs: now() - startedAt, renderedAt: null };
       manifest = snapshot;
       error = null;
       lastBox = box;
@@ -180,6 +205,7 @@ export function createOceanCurrentsLayer({
         scheduleRetry();
       } else {
         rendering.setOptions?.({ overlay, paused });
+        timing.renderedAt = now();
         rendering.setField(snapshot);
         rendering.start();
       }
@@ -249,6 +275,7 @@ export function createOceanCurrentsLayer({
       manifest = null;
       error = null;
       lastBox = null;
+      timing = null;
       clearTimers();
       removeMoveEnd?.();
       removeMoveEnd = null;
@@ -418,7 +445,8 @@ export function createOceanCurrentsLayer({
       };
     },
     getDiagnostics() {
-      return rendering?.getDiagnostics?.() || {};
+      const diagnostic = rendering?.getDiagnostics?.() || {};
+      return { ...diagnostic, timing: updateTiming(diagnostic.gpu) };
     },
     getParticleCount() {
       return rendering?.getParticleCount() || 0;

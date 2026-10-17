@@ -667,3 +667,32 @@ test('a box whose paths stop early is reseeded until it holds the spec coverage'
   );
   owner.destroy();
 });
+
+test('readyMs stamps the first diagnostics read that sees every cell ready', () => {
+  const h = harness();
+  h.owner.setField(field());
+  const batch = [...h.members][0];
+  batch.ready = false;
+  const pending = h.owner.getDiagnostics();
+  assert.equal(pending.ready, false);
+  assert.equal(pending.readyMs, null, 'not ready: no stamp');
+  batch.ready = true;
+  const done = h.owner.getDiagnostics();
+  assert.equal(done.ready, true);
+  assert.ok(Number.isFinite(done.readyMs), 'ready: stamped');
+  assert.ok(done.readyMs >= done.buildMs, 'ready follows the build');
+  const again = h.owner.getDiagnostics();
+  assert.equal(again.readyMs, done.readyMs, 'stamped once');
+  h.owner.setField(field());
+  const fresh = [...h.members][0];
+  fresh.ready = false;
+  assert.equal(
+    h.owner.getDiagnostics().readyMs,
+    null,
+    'a new field resets the stamp until its cells report ready',
+  );
+  fresh.ready = true;
+  assert.ok(Number.isFinite(h.owner.getDiagnostics().readyMs));
+  h.owner.clear();
+  assert.equal(h.owner.getDiagnostics().readyMs, null);
+});
