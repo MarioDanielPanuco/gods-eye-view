@@ -280,12 +280,14 @@ wiring (see below).
 A global 1/8° three-state raster (water / land / coastal-mixed, 2 bits per cell,
 1,036,816 bytes) derived from **GSHHG v2.3.7** intermediate-resolution coastline
 polygons (Wessel & Smith — https://www.soest.hawaii.edu/pwessel/gshhg/, fetched
-2026-08-29; `gshhs_i.b` SHA-256 in the folder README). It is the synchronous
-water/land lookup for ocean layers: blanking land cells in current fields and
-gating ocean-point queries. Composition: L1 land, L2 lakes carved back to water,
+2026-08-29; input and output SHA-256 digests in the folder README). It provides a
+synchronous water/land lookup after loading; no application consumer is wired
+in this contribution. Composition: L1 land, L2 lakes carved back to water,
 L3 islands-in-lakes land, L4 ponds water, L5 Antarctic ice front land, L6
-grounding line skipped. Regeneration is deterministic and committed:
+grounding line skipped. The regeneration script is committed:
 `node scripts/build-land-sea-mask.mjs path/to/gshhs_i.b`.
+The locally prepared grid-traversal correction still needs asset regeneration
+and an updated output digest before merge; see the folder README.
 
 GSHHG is distributed under the **LGPL, version 3 or later**; this raster is a
 derived work of the data and keeps that license (see the carve-out in
